@@ -723,6 +723,14 @@ pub(crate) fn read_fresh_config_warnings(since_epoch: u64) -> Vec<String> {
 }
 
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
+    if crate::platform::should_refuse_elevated(
+        crate::platform::is_elevated(),
+        std::env::var("PSMUX_ALLOW_ELEVATED").ok(),
+    ) {
+        eprintln!("psmux: refusing to run the server elevated (set PSMUX_ALLOW_ELEVATED=1 to override)");
+        std::process::exit(1);
+    }
+
     // Write crash info to a log file when stderr is unavailable (detached server)
     // and clean up port/key files so stale entries do not linger (issue #204).
     let panic_session_name = session_name.clone();
