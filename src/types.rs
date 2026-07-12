@@ -1499,6 +1499,24 @@ pub enum CtrlReq {
     RemoveHook(String),
     KillServer,
     WaitFor(String, WaitForOp),
+    EventsSubscribe {
+        names: Vec<String>,
+        categories: Vec<String>,
+        after: Option<crate::events::Cursor>,
+        tx: std::sync::mpsc::SyncSender<crate::events::SubscriberMsg>,
+        ack: std::sync::mpsc::Sender<String>,   // ack_json
+    },
+    EventsCursor(std::sync::mpsc::Sender<String>),          // "<uid>:<bus>:<seq>" or "ERR: dormant"
+    NotifyEvent {
+        pane_id: Option<usize>,       // parsed from caller's TMUX_PANE (%N)
+        pane_instance: Option<u64>,   // caller's PSMUX_PANE_INSTANCE
+        session_uid: String,          // caller's PSMUX_SESSION_UID
+        name: String,                 // "agent-done" | "agent-notify"
+        title_len: usize,
+        content: Option<String>,      // already capped at 4096 by CLI
+        resp: std::sync::mpsc::Sender<String>,  // "OK <seq>" | "STALE" | "ERR: ..."
+    },
+    PaneDataVersion(std::sync::mpsc::Sender<String>),       // "<u64>" of active pane
     DisplayMenu(String, Option<i16>, Option<i16>),
     DisplayMenuDirect(Menu),
     DisplayPopup(String, String, String, bool, Option<String>),

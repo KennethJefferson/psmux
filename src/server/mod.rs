@@ -4568,6 +4568,35 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                     }
                 }
+                CtrlReq::EventsSubscribe { names, categories, after, tx: sub_tx, ack } => {
+                    let a = app.bus.subscribe(names, categories, after, sub_tx);
+                    let _ = ack.send(a.ack_json);
+                }
+                CtrlReq::EventsCursor(resp) => {
+                    let out = if app.bus.is_active() {
+                        format!("{}:{}:{}", app.session_uid, app.bus.bus_id(), app.bus.latest_seq())
+                    } else {
+                        "ERR: bus dormant".to_string()
+                    };
+                    let _ = resp.send(out);
+                }
+                CtrlReq::NotifyEvent { pane_id, pane_instance, session_uid, name, title_len, content, resp } => {
+                    let live = live_pane_instance(&app, pane_id.unwrap_or(0));
+                    let valid = validate_notify(&app, pane_id, pane_instance, &session_uid, |_pid| live);
+                    let seq = handle_notify_validated(&mut app, valid, pane_id, pane_instance, &name, title_len, content);
+                    let _ = resp.send(match (valid, seq) {
+                        (true, Some(s)) => format!("OK {}", s),
+                        (false, _) => "STALE".to_string(),
+                        _ => "ERR: bus dormant".to_string(),
+                    });
+                }
+                CtrlReq::PaneDataVersion(resp) => {
+                    let v = app.windows.get(app.active_idx)
+                        .and_then(|w| active_pane(&w.root, &w.active_path))
+                        .map(|p| p.data_version.load(std::sync::atomic::Ordering::Relaxed))
+                        .unwrap_or(0);
+                    let _ = resp.send(format!("{}", v));
+                }
                 CtrlReq::DisplayMenu(menu_def, x, y) => {
                     let menu = parse_menu_definition(&menu_def, x, y);
                     if !menu.items.is_empty() {
@@ -5817,6 +5846,51 @@ pub(crate) fn publish_pane_transitions(app: &mut AppState, transitions: &[crate:
     }
 }
 
+/// Look up a live pane's instance by pane id across all windows (None = not found).
+pub(crate) fn live_pane_instance(app: &AppState, pane_id: usize) -> Option<u64> {
+    for w in &app.windows {
+        let mut found = None;
+        tree::for_each_pane(&w.root, &mut |p: &crate::types::Pane| {
+            if p.id == pane_id && !p.dead { found = Some(p.instance); }
+        });
+        if found.is_some() { return found; }
+    }
+    None
+}
+
+/// Pure validation used by NotifyEvent (lookup injected for testability).
+pub(crate) fn validate_notify(
+    app: &AppState,
+    pane_id: Option<usize>,
+    pane_instance: Option<u64>,
+    caller_session_uid: &str,
+    lookup: impl Fn(usize) -> Option<u64>,
+) -> bool {
+    if caller_session_uid.is_empty() || caller_session_uid != app.session_uid { return false; }
+    let (Some(pid), Some(pinst)) = (pane_id, pane_instance) else { return false; };
+    lookup(pid) == Some(pinst)
+}
+
+pub(crate) fn handle_notify_validated(
+    app: &mut AppState,
+    valid: bool,
+    pane_id: Option<usize>,
+    pane_instance: Option<u64>,
+    name: &str,
+    title_len: usize,
+    content: Option<String>,
+) -> Option<u64> {
+    let mut payload = serde_json::json!({ "title_len": title_len });
+    if let (true, Some(c)) = (app.event_content, content) {
+        payload["content"] = serde_json::Value::String(c);
+    }
+    if valid {
+        app.bus.publish(name, "agent", pane_id, pane_instance, payload)
+    } else {
+        app.bus.publish("stale-notify", "agent", pane_id, pane_instance, payload)
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests-rs/test_server.rs"]
 mod tests;
@@ -5848,3 +5922,7 @@ mod test_issue370_startup_error_passthrough;
 #[cfg(test)]
 #[path = "../../tests-rs/test_agent_events_wiring.rs"]
 mod test_agent_events_wiring;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_agent_events_handlers.rs"]
+mod test_agent_events_handlers;
