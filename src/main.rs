@@ -3830,11 +3830,18 @@ fn run_main() -> io::Result<()> {
                     i += 1;
                 }
                 wire.push('\n');
-                session::stream_control_lines(wire, |line| {
+                let clean_stop = session::stream_control_lines(wire, |line| {
                     if !show_heartbeat && line.contains("\"type\":\"heartbeat\"") { return true; }
                     println!("{}", line);
                     !line.contains("\"type\":\"closed\"")
                 })?;
+                // Exit 0 only when the stream ended via the terminal closed
+                // frame (the callback stopped it). EOF/timeout/read error
+                // before that is a transport loss and must exit nonzero.
+                if !clean_stop {
+                    eprintln!("psmux: events stream lost");
+                    std::process::exit(1);
+                }
                 return Ok(());
             }
             // notify - Publish an agent event from inside a pane (silent no-op outside psmux)

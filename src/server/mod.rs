@@ -4502,6 +4502,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.hooks.remove(&hook);
                 }
                 CtrlReq::KillServer => {
+                    // Tell event-bus subscribers the bus is closing so
+                    // `psmux events` can exit 0 (clean close) instead of
+                    // treating the imminent socket drop as transport loss.
+                    // Their connection threads wake from recv_timeout, write
+                    // the {"type":"closed"} frame, and flush; the drain
+                    // sleeps below give them time before process::exit.
+                    app.bus.close_all("server_exit");
                     // Notify control clients that the server is going away,
                     // matching tmux's "%exit" wire notification before close.
                     // Flushes through the writer thread so iTerm2 sees a

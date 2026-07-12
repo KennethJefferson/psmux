@@ -33,6 +33,57 @@ fn notify_json_shape() {
 }
 
 #[test]
+fn stream_stopped_by_callback_is_clean() {
+    // Preamble (OK + ack) skipped, one event line, then the closed frame:
+    // callback returns false on "closed" -> clean stop -> true.
+    let data = b"OK\n{\"type\":\"ack\"}\n{\"seq\":1}\n{\"type\":\"closed\",\"reason\":\"kill\"}\nignored\n";
+    let mut r = std::io::BufReader::new(&data[..]);
+    let mut seen = Vec::new();
+    let clean = session::stream_lines_until_stopped(&mut r, 2, |line| {
+        seen.push(line.to_string());
+        !line.contains("\"type\":\"closed\"")
+    });
+    assert!(clean);
+    assert_eq!(seen, vec![
+        "{\"seq\":1}".to_string(),
+        "{\"type\":\"closed\",\"reason\":\"kill\"}".to_string(),
+    ]);
+}
+
+#[test]
+fn stream_eof_without_closed_frame_is_transport_loss() {
+    // Stream ends (EOF) before any closed frame: the callback never stops it
+    // -> transport loss -> false.
+    let data = b"OK\n{\"type\":\"ack\"}\n{\"seq\":1}\n";
+    let mut r = std::io::BufReader::new(&data[..]);
+    let clean = session::stream_lines_until_stopped(&mut r, 2, |line| {
+        !line.contains("\"type\":\"closed\"")
+    });
+    assert!(!clean);
+}
+
+#[test]
+fn stream_eof_during_preamble_is_transport_loss() {
+    let data = b"OK\n";
+    let mut r = std::io::BufReader::new(&data[..]);
+    let clean = session::stream_lines_until_stopped(&mut r, 2, |_| true);
+    assert!(!clean);
+}
+
+#[test]
+fn stream_read_error_is_transport_loss() {
+    struct FailingReader;
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"))
+        }
+    }
+    let mut r = std::io::BufReader::new(FailingReader);
+    let clean = session::stream_lines_until_stopped(&mut r, 2, |_| true);
+    assert!(!clean);
+}
+
+#[test]
 fn notify_json_never_has_null_after_field() {
     // AMENDMENT 1 regression guard: build_notify_json must never itself
     // introduce an "after" key (that key belongs to the wait-event request

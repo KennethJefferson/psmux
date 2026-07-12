@@ -1257,16 +1257,52 @@ pub fn send_control_with_response_timeout(line: String, total_ms: u64) -> io::Re
     Ok(result)
 }
 
+/// Core read loop of [`stream_control_lines`], factored over any `BufRead`
+/// so it can be unit-tested without a live TCP server. Skips `lines_to_skip`
+/// preamble lines, then invokes `on_line` per line (CR/LF-trimmed).
+///
+/// Returns `true` when the stream stopped because `on_line` returned false
+/// (a CLEAN stop — the caller saw its terminal frame), and `false` when the
+/// stream ended on its own — EOF, read timeout, or read error — before the
+/// callback asked to stop (TRANSPORT LOSS from the caller's point of view).
+pub(crate) fn stream_lines_until_stopped(
+    reader: &mut impl std::io::BufRead,
+    mut lines_to_skip: usize,
+    mut on_line: impl FnMut(&str) -> bool,
+) -> bool {
+    let mut buf = String::new();
+    loop {
+        buf.clear();
+        match reader.read_line(&mut buf) {
+            Ok(0) => return false, // EOF before a clean stop
+            Ok(_) => {
+                let text = buf.trim_end_matches(['\r', '\n']);
+                if lines_to_skip > 0 {
+                    lines_to_skip -= 1;
+                    continue;
+                }
+                if !on_line(text) { return true; }
+            }
+            Err(_) => return false, // timeout or transport error
+        }
+    }
+}
+
 /// Line-streaming variant used by `events`: sends the same AUTH/TARGET/command
 /// preamble as [`send_control_with_response`], but does NOT half-close the
 /// write side and does NOT read to EOF — instead reads line by line (the
 /// server keeps this connection open, pushing one JSON event/heartbeat per
-/// line) and invokes `on_line` for each line after the initial "OK" ack line
-/// is skipped. Stops when `on_line` returns false or the connection ends.
+/// line) and invokes `on_line` for each line after the preamble is skipped.
+///
+/// Returns `Ok(true)` when streaming stopped because `on_line` returned false
+/// (clean stop — the callback saw its terminal frame, e.g. `"type":"closed"`).
+/// Returns `Ok(false)` when the stream ended WITHOUT the callback stopping it:
+/// unexpected EOF, read timeout, or read error mid-stream (transport loss).
+/// `Err` is returned only for setup failures (no server, connect failure).
 pub fn stream_control_lines(
     line: String,
-    mut on_line: impl FnMut(&str) -> bool,
-) -> io::Result<()> {
+    on_line: impl FnMut(&str) -> bool,
+) -> io::Result<bool> {
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     if is_warm_session(&target) {
@@ -1292,27 +1328,9 @@ pub fn stream_control_lines(
     let _ = write!(stream, "{}", line);
     let _ = stream.flush();
     let mut reader = io::BufReader::new(stream);
-    let mut buf = String::new();
     // Skip 2 preamble lines before any real event: the connection-level AUTH
     // "OK" ack, then the events-subscribe ack (the initial cursor/ack json).
-    let mut lines_to_skip = 2;
-    loop {
-        buf.clear();
-        match std::io::BufRead::read_line(&mut reader, &mut buf) {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                let text = buf.trim_end_matches(['\r', '\n']);
-                if lines_to_skip > 0 {
-                    lines_to_skip -= 1;
-                    continue;
-                }
-                if !on_line(text) { break; }
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
-            Err(_) => break,
-        }
-    }
-    Ok(())
+    Ok(stream_lines_until_stopped(&mut reader, 2, on_line))
 }
 
 /// Send a control message to a specific port with authentication
