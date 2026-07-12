@@ -518,6 +518,8 @@ pub struct AppState {
     pub next_pane_instance: u64,
     /// Server option: allow event content payloads (Task 5+).
     pub event_content: bool,
+    /// In-memory event bus (dormant until session identity is minted).
+    pub bus: crate::events::EventBus,
     /// Numeric session ID (tmux-compatible: $0, $1, $2...).
     pub session_id: usize,
     /// -L socket name for namespace isolation (tmux compatible).
@@ -776,9 +778,8 @@ impl AppState {
         i
     }
 
-    /// Temporary stub: Task 5 replaces this with the real dormant bus handle id.
     pub fn bus_id_string(&self) -> String {
-        String::new()
+        self.bus.bus_id().to_string()
     }
 
     /// Whether this server should run the periodic `status-interval` timer,
@@ -1015,6 +1016,7 @@ impl AppState {
             session_uid: String::new(),
             next_pane_instance: 1,
             event_content: false,
+            bus: crate::events::EventBus::new_dormant(),
             session_id: crate::session::allocate_session_id(),
             socket_name: None,
             attached_clients: 0,

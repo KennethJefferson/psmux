@@ -767,6 +767,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // CtrlReq::ClaimSession below, which mints the identity at that point.
     if !crate::session::is_warm_session(&app.session_name) {
         app.session_uid = crate::events::gen_uid();
+        app.bus.activate(app.session_uid.clone());
     }
 
     // ── P0: single-server-per-name guard (issue #2) ─────────────────────────
@@ -1116,6 +1117,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     let mut last_registry_check = Instant::now();
 
+    let mut last_bus_heartbeat = Instant::now();
+
     // Throttle reap_children: only check for exited processes every 250ms.
     // With hundreds of windows, calling try_wait() on every process each
     // loop iteration wastes CPU.  Exited processes are still reaped promptly
@@ -1145,6 +1148,11 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         if last_registry_check.elapsed() >= Duration::from_secs(5) {
             last_registry_check = Instant::now();
             ensure_session_registry_files(&home, &app);
+        }
+        // events bus heartbeat
+        if last_bus_heartbeat.elapsed() >= std::time::Duration::from_secs(crate::events::HEARTBEAT_SECS) {
+            app.bus.heartbeat();
+            last_bus_heartbeat = std::time::Instant::now();
         }
 
         // Adaptive timeout: ramps from 1ms (active typing/echo) through
@@ -3046,6 +3054,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // Server was dormant (empty session_uid) while __warm__; minting
                     // here activates identity now that it is a real, claimed session.
                     app.session_uid = crate::events::gen_uid();
+                    app.bus.activate(app.session_uid.clone());
                     // Warm server's created_at is the warm process start time, not the
                     // user's session-creation time — reset on claim or list-sessions /
                     // session_created / uptime would report the warm pool's age.
