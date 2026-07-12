@@ -1100,16 +1100,29 @@ pub fn classify_sessions_parallel(
 /// definitively Dead probe is treated as absent. Used by kill-session to
 /// decide whether it is tearing down the namespace's last real session.
 pub fn namespace_has_other_live_session(ns: Option<&str>, exclude_base: &str) -> bool {
-    let inputs: Vec<(String, String, String)> = list_session_names_ns(ns)
-        .into_iter()
-        .filter(|base| base != exclude_base)
-        .filter_map(|base| {
-            let port_path = format!("{}\\{}.port", registry_dir(), base);
-            let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
-            let key = read_session_key(&base).unwrap_or_default();
-            Some((base, format!("127.0.0.1:{}", port), key))
-        })
-        .collect();
+    let mut inputs: Vec<(String, String, String)> = Vec::new();
+    for base in list_session_names_ns(ns) {
+        if base == exclude_base {
+            continue;
+        }
+        let port_path = format!("{}\\{}.port", registry_dir(), base);
+        // An unreadable or malformed .port is NOT absence: fs::write is not
+        // atomic, so a reader can catch a session's registry entry mid-rewrite
+        // (registration, claim rename, 5s self-heal). Dropping it here could
+        // retire the warm standby while a real session lives. Uncertainty
+        // always counts as "present" — the cost of being wrong is only a warm
+        // server that outlives the namespace, never a broken real session.
+        // A file that vanished since the scan (NotFound) is genuine absence:
+        // that session tore down its own registry entry.
+        let port_str = match std::fs::read_to_string(&port_path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return true,
+        };
+        let Ok(port) = port_str.trim().parse::<u16>() else { return true };
+        let key = read_session_key(&base).unwrap_or_default();
+        inputs.push((base, format!("127.0.0.1:{}", port), key));
+    }
     classify_sessions_parallel(inputs, Duration::from_millis(250), Duration::from_millis(500))
         .into_iter()
         .any(|(_, v)| !matches!(v, SessionLiveness::Dead))
@@ -1136,8 +1149,12 @@ pub fn retire_warm_server(ns: Option<&str>) {
         None => "__warm__".to_string(),
     };
     let port_path = format!("{}\\{}.port", registry_dir(), warm_base);
-    let handoff = format!("{}.psmux-retiring", port_path);
-    let _ = std::fs::remove_file(&handoff); // stale handoff from a crashed retirer
+    // Per-retirer handoff name: two concurrent last-session kills must not
+    // clobber each other's in-flight handoff (a shared name let retirer B
+    // delete retirer A's file between A's rename and A's read, so NEITHER
+    // sent the retire). A crashed retirer leaves a single stale handoff
+    // behind, which is inert: it is never read again and matches no lookup.
+    let handoff = format!("{}.psmux-retiring-{}", port_path, std::process::id());
     if std::fs::rename(&port_path, &handoff).is_err() {
         return; // no warm entry, or a claimant already won the rename
     }

@@ -2978,31 +2978,42 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // exactly like ClaimSession refuses a second claim.
                     if app.is_warm_server() {
                         warm_debug(&format!("RETIRE ACCEPT: __warm__ (port={:?})", app.control_port));
+                        // Retirement is closed in three steps, not by timing:
+                        // 1. WARM_RETIRING — from this instant connection
+                        //    threads refuse claim-session synchronously with
+                        //    an explicit ERR (a committed claimant's ONLY
+                        //    cold-spawn trigger; it treats silence as success).
+                        // 2. Remove our own registry entry now, so no new
+                        //    claimant can even find this server. The 5s
+                        //    self-heal runs on THIS thread and never past this
+                        //    handler, so nothing resurrects the pointer.
+                        // 3. Drain requests already queued (sent before step 1)
+                        //    and refuse any ClaimSession among them; a short
+                        //    grace pass covers a send racing the flag check.
+                        crate::types::WARM_RETIRING.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let base = app.port_file_base();
+                        let _ = std::fs::remove_file(format!("{}\\{}.port", crate::session::registry_dir(), base));
+                        let _ = std::fs::remove_file(format!("{}\\{}.key", crate::session::registry_dir(), base));
                         let _ = resp.send("OK\n".to_string());
-                        // Drain the control channel before exiting. The 5s
-                        // registry self-heal (same thread — it cannot run past
-                        // this point) may have resurrected __warm__.port after
-                        // the retirer consumed it, letting a new-session claim
-                        // this dying server and COMMIT (a committed claimant
-                        // deliberately does not cold-spawn on a slow response).
-                        // Such a claim must get an explicit "ERR" — that is the
-                        // one reply that makes the claimant fall back to a cold
-                        // spawn; silence strands it waiting for a session that
-                        // will never appear. The drain window also flushes our
-                        // own OK through the connection thread.
-                        let drain_deadline = std::time::Instant::now() + Duration::from_millis(500);
-                        if let Some(rx) = app.control_rx.as_ref() {
-                            while std::time::Instant::now() < drain_deadline {
-                                match rx.recv_timeout(Duration::from_millis(50)) {
-                                    Ok(CtrlReq::ClaimSession(name, _, cresp)) => {
+                        let refuse_claims = |rx: &std::sync::mpsc::Receiver<CtrlReq>| {
+                            while let Ok(req) = rx.try_recv() {
+                                match req {
+                                    CtrlReq::ClaimSession(name, _, cresp) => {
                                         warm_debug(&format!("CLAIM REFUSED while retiring: requested name='{}'", name));
                                         let _ = cresp.send("ERR: not a warm server (retiring)\n".to_string());
                                     }
-                                    Ok(CtrlReq::RetireWarm(r2)) => { let _ = r2.send("OK\n".to_string()); }
-                                    Ok(_) => {}
-                                    Err(_) => {}
+                                    CtrlReq::RetireWarm(r2) => { let _ = r2.send("OK\n".to_string()); }
+                                    _ => {}
                                 }
                             }
+                        };
+                        if let Some(rx) = app.control_rx.as_ref() {
+                            refuse_claims(rx);
+                            // Grace pass: a connection thread that passed the
+                            // WARM_RETIRING check just before step 1 may still
+                            // be about to enqueue. One beat, then final sweep.
+                            std::thread::sleep(Duration::from_millis(100));
+                            refuse_claims(rx);
                         }
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }

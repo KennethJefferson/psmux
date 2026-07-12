@@ -1535,12 +1535,25 @@ match cmd {
         // Usage: claim-session <name> [<client-cwd>]
         let non_flag: Vec<&str> = args.iter().filter(|a| !a.starts_with('-')).map(|s| &**s).collect();
         if let Some(name) = non_flag.first().copied() {
+            // Retiring servers refuse claims HERE, without touching the main
+            // loop: once RetireWarm teardown has begun the loop may never
+            // dequeue this request, and a committed claimant interprets
+            // silence as success (no cold-spawn fallback). The explicit ERR
+            // is what sends it down the cold-spawn path instead. The flag is
+            // checked immediately before the send; the residual window is a
+            // single instruction wide and is covered by the handler's final
+            // queue drain.
             let client_cwd = non_flag.get(1).map(|s| s.to_string());
             let (rtx, rrx) = mpsc::channel::<String>();
-            let _ = tx.send(CtrlReq::ClaimSession(name.to_string(), client_cwd, rtx));
-            if let Ok(resp) = rrx.recv_timeout(std::time::Duration::from_secs(5)) {
-                let _ = write!(write_stream, "{}", resp);
+            if crate::types::WARM_RETIRING.load(std::sync::atomic::Ordering::SeqCst) {
+                let _ = write!(write_stream, "ERR: not a warm server (retiring)\n");
                 let _ = write_stream.flush();
+            } else {
+                let _ = tx.send(CtrlReq::ClaimSession(name.to_string(), client_cwd, rtx));
+                if let Ok(resp) = rrx.recv_timeout(std::time::Duration::from_secs(5)) {
+                    let _ = write!(write_stream, "{}", resp);
+                    let _ = write_stream.flush();
+                }
             }
         }
     }

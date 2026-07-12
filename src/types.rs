@@ -1630,6 +1630,14 @@ pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Lets the server loop skip the tree walk when no CPR response is needed.
 pub static CPR_DATA_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set once when this (warm) server accepts a `retire-warm` and begins its
+/// terminal teardown. Connection threads check it to refuse `claim-session`
+/// SYNCHRONOUSLY — a claimant must get an explicit `ERR` (its cold-spawn
+/// fallback trigger) no matter where the main loop is in the teardown, because
+/// a claim that has won the `__warm__.port` rename deliberately does not fall
+/// back on a silent/slow response. Never cleared: retirement is one-way.
+pub static WARM_RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Issue #440: `pipe-pane` output routing.
 ///
 /// A pane's PTY reader thread tees every raw output chunk to any pipe writer

@@ -155,9 +155,12 @@ if ($survived -eq $ROUNDS) { P "new session survived the race in all $ROUNDS rou
 # during its own startup window) survives pointerless and re-heals its
 # registry entry within one 5s self-heal tick — making it a normal, REUSABLE
 # standby, not a leak. kill-session's retirement is best-effort under that
-# concurrency, so the leak-freedom property to assert is: every test-born
-# warm is either already retired or still reachable and retirable. Wait out
-# one self-heal period, retire any survivor over the wire, then require zero.
+# concurrency, so the leak-freedom property to assert HERE is: every
+# test-born warm is either already retired or still reachable and retirable.
+# The STRICT guarantee — the last kill-session itself retires the warm — is
+# asserted under sequential conditions in test_registry_sandbox_e2e.ps1;
+# this fallback exists only for the concurrent case and logs an INFO line
+# whenever it actually fires, so silent regressions still show up in output.
 Start-Sleep -Seconds 6
 if (Test-Path "$REG\__warm__.port") {
   $wp = [int](Get-Content "$REG\__warm__.port").Trim()

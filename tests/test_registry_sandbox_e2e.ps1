@@ -53,7 +53,16 @@ function Send-AuthedCommand([int]$port, [string]$key, [string]$cmd) {
 }
 
 $realReg = "$env:USERPROFILE\.psmux"
-$realBefore = @(Get-ChildItem $realReg -File -EA SilentlyContinue | ForEach-Object Name) | Sort-Object
+# Fingerprint name+size+mtime (not just names): a rewritten/overwritten
+# registry artifact must count as "touched" even if the file set is identical.
+# REGISTRY artifacts only — diagnostics (ssh_input.log, autorename.log, ...)
+# live in the same directory by design and legitimately change during any run.
+function Real-Registry-Fingerprint {
+  @(Get-ChildItem $realReg -File -EA SilentlyContinue |
+    Where-Object { $_.Extension -in ".port",".key",".sid",".pid",".spawnlock",".claiming" -or $_.Name -in "last_session","next_session_id" } |
+    ForEach-Object { "$($_.Name)|$($_.Length)|$($_.LastWriteTimeUtc.Ticks)" }) | Sort-Object
+}
+$realBefore = Real-Registry-Fingerprint
 $testStart = Get-Date
 
 # --- 1. two sessions; registry state must land in the sandbox
@@ -95,10 +104,13 @@ $leftover = Warm-Born-Since $testStart
 if ($leftover -eq 0) { P "no warm processes born during the test remain" }
 else { F "warm process leak: $leftover test-born warm server(s) alive after last kill-session" }
 
-# --- 1b. real ~/.psmux must be byte-identical in membership
-$realAfter = @(Get-ChildItem $realReg -File -EA SilentlyContinue | ForEach-Object Name) | Sort-Object
-if (($realBefore -join ",") -eq ($realAfter -join ",")) { P "real ~/.psmux registry untouched" }
-else { F "real ~/.psmux changed: before=[$($realBefore -join ',')] after=[$($realAfter -join ',')]" }
+# --- 1b. real ~/.psmux must be untouched (names, sizes, AND mtimes)
+$realAfter = Real-Registry-Fingerprint
+if (($realBefore -join ",") -eq ($realAfter -join ",")) { P "real ~/.psmux registry untouched (content fingerprint)" }
+else {
+  $changed = @(Compare-Object $realBefore $realAfter | ForEach-Object { $_.InputObject.Split('|')[0] }) | Sort-Object -Unique
+  F "real ~/.psmux changed: [$($changed -join ',')]"
+}
 
 Remove-Item -Recurse -Force $REG -EA SilentlyContinue
 Remove-Item Env:\PSMUX_REGISTRY_DIR -EA SilentlyContinue
