@@ -448,6 +448,40 @@ fn namespace_has_other_live_session_empty_registry_is_false() {
 }
 
 #[test]
+fn retire_warm_server_is_a_noop_without_a_warm_entry() {
+    // No warm registry entry for this namespace: nothing to contact, no panic,
+    // and nothing new may appear in the registry.
+    let dir = registry_dir();
+    retire_warm_server(Some("rwtest_none"));
+    assert!(!std::path::Path::new(&format!("{}\\rwtest_none____warm__.port", dir)).exists());
+}
+
+#[test]
+fn retire_warm_server_swallows_garbage_and_dead_entries() {
+    // Namespaced warm base so parallel tests scanning the shared sandbox
+    // registry never mistake these fixtures for their own sessions.
+    let dir = registry_dir();
+    let warm_base = "rwtest_dead____warm__";
+    let port_path = format!("{}\\{}.port", dir, warm_base);
+    let key_path = format!("{}\\{}.key", dir, warm_base);
+
+    // Garbage port file: parse fails -> silent no-op.
+    std::fs::write(&port_path, "not-a-port").unwrap();
+    retire_warm_server(Some("rwtest_dead"));
+
+    // Well-formed entry pointing at a dead port: connect fails -> swallowed.
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = l.local_addr().unwrap().port();
+    drop(l);
+    std::fs::write(&port_path, dead_port.to_string()).unwrap();
+    std::fs::write(&key_path, "0123456789abcdef").unwrap();
+    retire_warm_server(Some("rwtest_dead"));
+
+    let _ = std::fs::remove_file(&port_path);
+    let _ = std::fs::remove_file(&key_path);
+}
+
+#[test]
 fn namespace_has_other_live_session_dead_entry_is_false_unverifiable_is_true() {
     let ns = "nsholstest";
     let dir = registry_dir();
