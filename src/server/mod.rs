@@ -1837,19 +1837,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         hook_event = Some("client-detached");
                         if app.attached_clients == 0 && app.destroy_unattached {
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                            let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                            let _ = std::fs::remove_file(&regpath);
-                            let _ = std::fs::remove_file(&keypath);
-                            crate::session::remove_session_id_file(&app.port_file_base());
                             crate::types::shutdown_persistent_streams();
                             tree::kill_all_children_batch(&mut app.windows);
                             if let Some(mut wp) = app.warm_pane.take() {
                                 wp.child.kill().ok();
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
-                            std::process::exit(0);
+                            shutdown_server(&mut app, "detach-exit");
                         }
                     }
                 }
@@ -2946,14 +2940,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::KillSession => {
                     // Fire session-closed hook before cleanup
                     if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    // Remove port/key/sid files FIRST so clients see the session
-                    // as gone immediately, then kill processes.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                    let _ = std::fs::remove_file(&regpath);
-                    let _ = std::fs::remove_file(&keypath);
-                    crate::session::remove_session_id_file(&app.port_file_base());
                     crate::types::send_directive_to_all_clients("DETACH");
                     std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
@@ -2964,7 +2950,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // TerminateProcess is synchronous on Windows — processes
                     // are already dead.  Minimal delay for OS handle cleanup.
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    std::process::exit(0);
+                    shutdown_server(&mut app, "session-teardown");
                 }
                 CtrlReq::HasSession(resp) => {
                     let _ = resp.send(true);
@@ -4165,19 +4151,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     });
                     hook_event = Some("client-detached");
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
                             wp.child.kill().ok();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        shutdown_server(&mut app, "detach-exit");
                     }
                 }
                 CtrlReq::ForceDetachClientByTty(tty, kill_parent) => {
@@ -4252,19 +4232,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         hook_event = Some("client-detached");
                     }
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
                             wp.child.kill().ok();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        shutdown_server(&mut app, "detach-exit");
                     }
                 }
                 CtrlReq::DetachAllClients(kill_parent) => {
@@ -4303,19 +4277,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         hook_event = Some("client-detached");
                     }
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
                             wp.child.kill().ok();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        shutdown_server(&mut app, "detach-exit");
                     }
                 }
                 CtrlReq::SwitchClient(target, flag) => {
@@ -4502,13 +4470,22 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.hooks.remove(&hook);
                 }
                 CtrlReq::KillServer => {
-                    // Tell event-bus subscribers the bus is closing so
-                    // `psmux events` can exit 0 (clean close) instead of
-                    // treating the imminent socket drop as transport loss.
-                    // Their connection threads wake from recv_timeout, write
-                    // the {"type":"closed"} frame, and flush; the drain
-                    // sleeps below give them time before process::exit.
-                    app.bus.close_all("server_exit");
+                    // Tell event-bus subscribers the bus is closing as early as
+                    // possible so `psmux events` can exit 0 (clean close) instead
+                    // of treating the imminent socket drop as transport loss, and
+                    // so it has the maximum head start over the CLI's own
+                    // kill-server nuclear fallback (kill_remaining_server_processes
+                    // in main.rs, which terminates any surviving psmux.exe by image
+                    // name ~50ms after this server's control connection closes —
+                    // that fallback races independently of anything server-side,
+                    // so the subscriber's write must not be delayed behind the
+                    // rest of this handler's cleanup). Their connection threads
+                    // wake from recv_timeout, write the {"type":"closed"} frame,
+                    // and flush immediately; shutdown_server's close_all below is
+                    // a harmless no-op repeat (drain-based) that also covers any
+                    // subscriber that arrived after this point.
+                    let _ = app.bus.publish("bus-closed", "bus", None, None, serde_json::json!({ "reason": "kill-server" }));
+                    app.bus.close_all("kill-server");
                     // Notify control clients that the server is going away,
                     // matching tmux's "%exit" wire notification before close.
                     // Flushes through the writer thread so iTerm2 sees a
@@ -4524,13 +4501,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // %exit + ST before the process exits.
                         std::thread::sleep(std::time::Duration::from_millis(80));
                     }
-                    // Remove port/key files FIRST so clients see the session
-                    // as gone immediately, then kill processes.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                    let _ = std::fs::remove_file(&regpath);
-                    let _ = std::fs::remove_file(&keypath);
                     crate::types::send_directive_to_all_clients("DETACH");
                     std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
@@ -4541,7 +4511,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // TerminateProcess is synchronous on Windows — processes
                     // are already dead.  Minimal delay for OS handle cleanup.
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    std::process::exit(0);
+                    // shutdown_server publishes bus-closed + close_all("kill-server")
+                    // (idempotent even though close_all is drain-based) and removes
+                    // the registry files before exiting.
+                    shutdown_server(&mut app, "kill-server");
                 }
                 CtrlReq::WaitFor(channel, op) => {
                     match op {
@@ -5808,24 +5781,44 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // the DCS stream before we tear down the process.
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                let _ = std::fs::remove_file(&regpath);
-                let _ = std::fs::remove_file(&keypath);
                 crate::types::send_directive_to_all_clients("DETACH");
                 std::thread::sleep(Duration::from_millis(50));
                 crate::types::shutdown_persistent_streams();
                 // Kill warm pane's child (process::exit skips Drop)
                 if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                std::process::exit(0);
+                shutdown_server(&mut app, "exit-empty");
             }
         }
         // recv_timeout already handles the wait; no additional sleep needed.
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Single orderly-exit path: publish the terminal `bus-closed` event, close
+/// out subscribers (so `psmux events` sees a clean `{"type":"closed"}` frame
+/// instead of transport loss), then perform the registry-file cleanup every
+/// call site used to do inline before `process::exit`. Callers still run
+/// their own site-specific pre-cleanup (client DETACH directives, control
+/// `%exit` notifications, killing child processes, warm-pane teardown) —
+/// this is only the shared tail.
+///
+/// The 80ms sleep after `close_all` gives subscriber writer threads a beat
+/// to flush the closed frame before the process disappears; do not remove
+/// it or convert `close_all`'s `try_send` into a blocking send (slow
+/// consumers are intentionally dropped, not allowed to stall shutdown).
+pub(crate) fn shutdown_server(app: &mut AppState, reason: &'static str) -> ! {
+    let _ = app.bus.publish("bus-closed", "bus", None, None, serde_json::json!({ "reason": reason }));
+    app.bus.close_all(reason);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
+    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+    let _ = std::fs::remove_file(&regpath);
+    let _ = std::fs::remove_file(&keypath);
+    crate::session::remove_session_id_file(&app.port_file_base());
+    std::process::exit(0);
 }
 
 /// Map a committed hook_event tag to a bus event. Called from the hook_event
