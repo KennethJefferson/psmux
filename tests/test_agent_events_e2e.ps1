@@ -40,5 +40,18 @@ if ($LASTEXITCODE -ne 4) { throw "expected mismatch exit 4, got $LASTEXITCODE" }
 $cap = & $P -t "${S}:%1" capture-pane -p --settle 300 --settle-timeout 5000
 if (($cap -join "`n") -notmatch "SETTLED-MARKER") { throw "settle capture missed output" }
 
+# --- capture-pane -t %N --settle targets the RIGHT pane, not whatever is
+# active. %1 stays active/focused throughout; %2 (already split above) gets a
+# marker only it should show. Regression test for the settle-probe temp-focus
+# bug: PaneDataVersion(None) probes used to consume the FocusPaneTemp restore
+# and the final capture landed on %1 instead of the -t %2 target.
+& $P -t "${S}:%1" send-keys "echo ACTIVE-PANE-MARKER" Enter
+Start-Sleep -m 300
+& $P -t "${S}:%2" send-keys "echo NONACTIVE-MARKER" Enter
+$cap2 = & $P -t "${S}:%2" capture-pane -p --settle 300 --settle-timeout 5000
+$joined2 = $cap2 -join "`n"
+if ($joined2 -notmatch "NONACTIVE-MARKER") { throw "settle capture on -t %2 missed its own marker: $joined2" }
+if ($joined2 -match "ACTIVE-PANE-MARKER") { throw "settle capture on -t %2 leaked the active pane's content: $joined2" }
+
 & $P kill-server 2>$null
 Write-Host "PASS test_agent_events_e2e"

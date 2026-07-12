@@ -1526,7 +1526,14 @@ pub enum CtrlReq {
         content: Option<String>,      // already capped at 4096 by CLI
         resp: std::sync::mpsc::Sender<String>,  // "OK <seq>" | "STALE" | "ERR: ..."
     },
-    PaneDataVersion(std::sync::mpsc::Sender<String>),       // "<u64>" of active pane
+    /// "<u64>" of the targeted pane's data_version. `Some(pane_id)` looks up that
+    /// specific pane (any window, via the same tree-walk as `live_pane_instance`)
+    /// and replies "NOPANE" if it can't be found; `None` keeps the legacy
+    /// active-pane behavior. Used by `capture-pane --settle` so probes and the
+    /// final capture stay pinned to the `-t` target instead of drifting to
+    /// whatever pane is active when a probe happens to consume the temp-focus
+    /// restore (see `is_temp_focus`).
+    PaneDataVersion(Option<usize>, std::sync::mpsc::Sender<String>),
     DisplayMenu(String, Option<i16>, Option<i16>),
     DisplayMenuDirect(Menu),
     DisplayPopup(String, String, String, bool, Option<String>),

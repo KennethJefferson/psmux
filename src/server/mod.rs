@@ -1335,7 +1335,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         | CtrlReq::WindowLayout(..)
                     );
                     let is_temp_focus = matches!(&req,
-                        CtrlReq::FocusWindowTemp(_) | CtrlReq::FocusWindowByIdTemp(_) | CtrlReq::FocusWindowByNameTemp(_) | CtrlReq::FocusPaneTemp(_) | CtrlReq::FocusPaneByIndexTemp(_));
+                        CtrlReq::FocusWindowTemp(_) | CtrlReq::FocusWindowByIdTemp(_) | CtrlReq::FocusWindowByNameTemp(_) | CtrlReq::FocusPaneTemp(_) | CtrlReq::FocusPaneByIndexTemp(_)
+                        // capture-pane --settle's poll loop: must never consume the
+                        // temp-focus restore, or a probe landing between FocusPaneTemp
+                        // and the final CapturePane would snap focus back to the
+                        // original active pane before the capture fires (see
+                        // PaneDataVersion doc comment in types.rs).
+                        | CtrlReq::PaneDataVersion(..));
                     let mut hook_event: Option<&str> = None;
                     // Track active_idx changes for debugging window-switch issues
                     let _prev_active_idx = app.active_idx;
@@ -4570,12 +4576,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         _ => "ERR: bus dormant".to_string(),
                     });
                 }
-                CtrlReq::PaneDataVersion(resp) => {
-                    let v = app.windows.get(app.active_idx)
-                        .and_then(|w| active_pane(&w.root, &w.active_path))
-                        .map(|p| p.data_version.load(std::sync::atomic::Ordering::Relaxed))
-                        .unwrap_or(0);
-                    let _ = resp.send(format!("{}", v));
+                CtrlReq::PaneDataVersion(pane_id, resp) => {
+                    let out = match pane_id {
+                        Some(pid) => {
+                            let mut found: Option<u64> = None;
+                            for w in &app.windows {
+                                let mut v = None;
+                                tree::for_each_pane(&w.root, &mut |p: &crate::types::Pane| {
+                                    if p.id == pid { v = Some(p.data_version.load(std::sync::atomic::Ordering::Relaxed)); }
+                                });
+                                if v.is_some() { found = v; break; }
+                            }
+                            match found {
+                                Some(v) => format!("{}", v),
+                                None => "NOPANE".to_string(),
+                            }
+                        }
+                        None => {
+                            let v = app.windows.get(app.active_idx)
+                                .and_then(|w| active_pane(&w.root, &w.active_path))
+                                .map(|p| p.data_version.load(std::sync::atomic::Ordering::Relaxed))
+                                .unwrap_or(0);
+                            format!("{}", v)
+                        }
+                    };
+                    let _ = resp.send(out);
                 }
                 CtrlReq::DisplayMenu(menu_def, x, y) => {
                     let menu = parse_menu_definition(&menu_def, x, y);

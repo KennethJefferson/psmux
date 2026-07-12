@@ -14,7 +14,11 @@ use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
 
 /// Read one \n-terminated line with a byte cap. Ok(Some(line)) includes the newline;
-/// Ok(Some("")) is EOF; Ok(None) means the cap was exceeded before a newline (protocol violation).
+/// Ok(Some("")) is EOF; Ok(None) means either the cap was exceeded before a newline
+/// (protocol violation) OR the deadline expired first — the caller cannot distinguish
+/// the two from the return value alone. This is intentional: both are treated
+/// identically by every call site (reject/close the connection), so there is no
+/// behavioral reason to thread through which one happened.
 pub(crate) fn read_line_bounded<R: std::io::BufRead>(
     r: &mut R,
     cap: usize,
@@ -1033,14 +1037,27 @@ match cmd {
         let settle_quiet_ms: Option<u64> = crate::cli::extract_flag_value(&args, "-W").and_then(|v| v.parse::<u64>().ok());
         let settle_timeout_ms: u64 = crate::cli::extract_flag_value(&args, "-Y").and_then(|v| v.parse::<u64>().ok()).unwrap_or(10_000);
         let mut settle_timed_out = false;
+        // Resolve the -t target to a concrete pane id so the settle probes (and
+        // the final capture below) stay pinned to it. `pane_is_id` + `target_pane`
+        // is exactly how `FocusPaneTemp` resolves %N targeting (see the -t
+        // dispatch above); index-based or absent targeting falls back to the
+        // legacy active-pane probe (None), same as before this fix.
+        let settle_target_pane: Option<usize> = if pane_is_id { target_pane } else { None };
         if let Some(quiet_ms) = settle_quiet_ms {
             let settle_deadline = std::time::Instant::now() + std::time::Duration::from_millis(settle_timeout_ms);
             let mut last_v = String::new();
             let mut stable_since = std::time::Instant::now();
             loop {
                 let (rtx, rrx) = mpsc::channel::<String>();
-                let _ = tx.send(CtrlReq::PaneDataVersion(rtx));
+                let _ = tx.send(CtrlReq::PaneDataVersion(settle_target_pane, rtx));
                 let v = rrx.recv().unwrap_or_default();
+                if v == "NOPANE" {
+                    // Target pane vanished (killed mid-settle) or was never
+                    // found — treat like a settle timeout rather than
+                    // pretending version 0 (which could spuriously "stabilize").
+                    settle_timed_out = true;
+                    break;
+                }
                 if v != last_v { last_v = v; stable_since = std::time::Instant::now(); }
                 if stable_since.elapsed() >= std::time::Duration::from_millis(quiet_ms) { break; }
                 if std::time::Instant::now() >= settle_deadline {
