@@ -1026,6 +1026,30 @@ match cmd {
             Some(v) => v.parse::<i32>().ok(),
             None => None,
         };
+        // -W <quiet_ms>: settle pre-wait before capturing. -Y <settle_timeout_ms>
+        // (default 10000) bounds the wait; on expiry a SETTLE-TIMEOUT marker
+        // line precedes the captured output so the CLI can map it to a
+        // nonzero exit (Task 9) while still returning the capture.
+        let settle_quiet_ms: Option<u64> = crate::cli::extract_flag_value(&args, "-W").and_then(|v| v.parse::<u64>().ok());
+        let settle_timeout_ms: u64 = crate::cli::extract_flag_value(&args, "-Y").and_then(|v| v.parse::<u64>().ok()).unwrap_or(10_000);
+        let mut settle_timed_out = false;
+        if let Some(quiet_ms) = settle_quiet_ms {
+            let settle_deadline = std::time::Instant::now() + std::time::Duration::from_millis(settle_timeout_ms);
+            let mut last_v = String::new();
+            let mut stable_since = std::time::Instant::now();
+            loop {
+                let (rtx, rrx) = mpsc::channel::<String>();
+                let _ = tx.send(CtrlReq::PaneDataVersion(rtx));
+                let v = rrx.recv().unwrap_or_default();
+                if v != last_v { last_v = v; stable_since = std::time::Instant::now(); }
+                if stable_since.elapsed() >= std::time::Duration::from_millis(quiet_ms) { break; }
+                if std::time::Instant::now() >= settle_deadline {
+                    settle_timed_out = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
         let (rtx, rrx) = mpsc::channel::<String>();
         if escape_seqs {
             let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end));
@@ -1044,6 +1068,9 @@ match cmd {
                 if persistent {
                     let _ = tx.send(CtrlReq::ShowTextPopup("capture-pane".to_string(), text));
                 } else {
+                    if settle_timed_out {
+                        let _ = write!(write_stream, "SETTLE-TIMEOUT\n");
+                    }
                     let _ = write_stream.write_all(text.as_bytes());
                     let _ = write_stream.flush();
                 }
@@ -3076,6 +3103,112 @@ match cmd {
             }
         }
         if !persistent { break; }
+    }
+    "events-subscribe" => {
+        let mut names = Vec::new();
+        let mut categories = Vec::new();
+        let mut after = None;
+        for a in &args {
+            if let Some(v) = a.strip_prefix("name=") { names.push(v.to_string()); }
+            else if let Some(v) = a.strip_prefix("category=") { categories.push(v.to_string()); }
+            else if let Some(v) = a.strip_prefix("after=") { after = crate::events::Cursor::parse(v); }
+        }
+        let (sub_tx, sub_rx) = std::sync::mpsc::sync_channel(crate::events::SUB_CHANNEL_CAP);
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<String>();
+        let _ = tx.send(CtrlReq::EventsSubscribe { names, categories, after, tx: sub_tx, ack: ack_tx });
+        if let Ok(ack) = ack_rx.recv() {
+            if write!(write_stream, "{}\n", ack).is_err() { break; }
+            let _ = write_stream.flush();
+        } else { break; }
+        // stream until closed/disconnect; recv timeout bounds the write-liveness check
+        loop {
+            match sub_rx.recv_timeout(std::time::Duration::from_secs(crate::events::HEARTBEAT_SECS + 5)) {
+                Ok(crate::events::SubscriberMsg::Event(e)) => {
+                    let line = serde_json::to_string(&*e).unwrap_or_default();
+                    if write!(write_stream, "{}\n", line).is_err() || write_stream.flush().is_err() { break; }
+                }
+                Ok(crate::events::SubscriberMsg::Heartbeat) => {
+                    if write!(write_stream, "{{\"type\":\"heartbeat\"}}\n").is_err() || write_stream.flush().is_err() { break; }
+                }
+                Ok(crate::events::SubscriberMsg::Closed(r)) => {
+                    let _ = write!(write_stream, "{{\"type\":\"closed\",\"reason\":\"{}\"}}\n", r);
+                    let _ = write_stream.flush();
+                    break;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue, // bus heartbeat missed; keep waiting
+                Err(_) => break,
+            }
+        }
+        break; // connection is consumed by the stream
+    }
+    "events-cursor" => {
+        let (rtx, rrx) = std::sync::mpsc::channel::<String>();
+        let _ = tx.send(CtrlReq::EventsCursor(rtx));
+        if let Ok(t) = rrx.recv() {
+            let _ = write!(write_stream, "{}\n", t);
+            let _ = write_stream.flush();
+        }
+        if !persistent { break; }
+    }
+    "notify-event" => {
+        let reply = (|| -> String {
+            let raw = args.join(" ");
+            let v: serde_json::Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return "ERR: bad json".into() };
+            let (rtx, rrx) = std::sync::mpsc::channel::<String>();
+            let _ = tx.send(CtrlReq::NotifyEvent {
+                pane_id: v.get("pane_id").and_then(|x| x.as_u64()).map(|x| x as usize),
+                pane_instance: v.get("pane_instance").and_then(|x| x.as_u64()),
+                session_uid: v.get("session_uid").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                name: v.get("name").and_then(|x| x.as_str()).unwrap_or("agent-notify").to_string(),
+                title_len: v.get("title_len").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+                content: v.get("content").and_then(|x| x.as_str()).map(|s| s.chars().take(4096).collect()),
+                resp: rtx,
+            });
+            rrx.recv().unwrap_or_else(|_| "ERR: server".into())
+        })();
+        let _ = write!(write_stream, "{}\n", reply);
+        let _ = write_stream.flush();
+        if !persistent { break; }
+    }
+    "wait-event" => {
+        let raw = args.join(" ");
+        let reply = (|| -> String {
+            let v: serde_json::Value = match serde_json::from_str(&raw) { Ok(v) => v, Err(_) => return "ERR: bad json".into() };
+            let want_pane = v.get("pane_id").and_then(|x| x.as_u64()).map(|x| x as usize);
+            let want_inst = v.get("pane_instance").and_then(|x| x.as_u64());
+            let want_name = v.get("name").and_then(|x| x.as_str()).map(|s| s.to_string());
+            let after = v.get("after").and_then(|x| x.as_str()).and_then(crate::events::Cursor::parse);
+            let timeout_ms = v.get("timeout_ms").and_then(|x| x.as_u64()).unwrap_or(60_000);
+            if v.get("after").is_some() && after.is_none() { return "ERR: bad cursor".into(); }
+            let (sub_tx, sub_rx) = std::sync::mpsc::sync_channel(crate::events::SUB_CHANNEL_CAP);
+            let (ack_tx, ack_rx) = std::sync::mpsc::channel::<String>();
+            let names = want_name.clone().map(|n| vec![n]).unwrap_or_default();
+            let _ = tx.send(CtrlReq::EventsSubscribe { names, categories: vec![], after, tx: sub_tx, ack: ack_tx });
+            let ack: serde_json::Value = match ack_rx.recv().ok().and_then(|s| serde_json::from_str(&s).ok()) {
+                Some(a) => a, None => return "ERR: server".into(),
+            };
+            if ack.get("mismatch").and_then(|x| x.as_bool()) == Some(true) { return "MISMATCH".into(); }
+            if ack.get("gap").and_then(|x| x.as_bool()) == Some(true) { return "GAP".into(); }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+            loop {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() { return "TIMEOUT".into(); }
+                match sub_rx.recv_timeout(left) {
+                    Ok(crate::events::SubscriberMsg::Event(e)) => {
+                        if want_pane.is_some() && e.pane != want_pane { continue; }
+                        if want_inst.is_some() && e.pane_instance != want_inst { continue; }
+                        return serde_json::to_string(&*e).unwrap_or_else(|_| "ERR: encode".into());
+                    }
+                    Ok(crate::events::SubscriberMsg::Heartbeat) => continue,
+                    Ok(crate::events::SubscriberMsg::Closed(_)) => return "ENDED".into(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return "TIMEOUT".into(),
+                    Err(_) => return "ENDED".into(),
+                }
+            }
+        })();
+        let _ = write!(write_stream, "{}\n", reply);
+        let _ = write_stream.flush();
+        break; // one-shot; the bus prunes the subscriber on next publish (channel disconnected)
     }
     _ => {}
 }
