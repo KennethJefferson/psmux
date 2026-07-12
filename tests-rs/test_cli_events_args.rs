@@ -84,6 +84,18 @@ fn stream_read_error_is_transport_loss() {
 }
 
 #[test]
+fn warm_claimed_pane_detection() {
+    // TMUX_PANE set + PSMUX_PANE_INSTANCE absent/empty => warm-claimed initial pane.
+    assert!(is_warm_claimed_pane(Some("%1"), None));
+    assert!(is_warm_claimed_pane(Some("%1"), Some("")));
+    // Normal cold-spawned pane: both present.
+    assert!(!is_warm_claimed_pane(Some("%1"), Some("3")));
+    // Fully outside psmux: TMUX_PANE itself absent — not the warm-claim case.
+    assert!(!is_warm_claimed_pane(None, None));
+    assert!(!is_warm_claimed_pane(Some(""), None));
+}
+
+#[test]
 fn notify_json_never_has_null_after_field() {
     // AMENDMENT 1 regression guard: build_notify_json must never itself
     // introduce an "after" key (that key belongs to the wait-event request

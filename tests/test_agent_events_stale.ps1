@@ -21,7 +21,7 @@ $json = '{"pane_id":1,"pane_instance":' + $old[0] + ',"session_uid":"' + $old[1]
 # bare token corrupts it before it reaches serde_json. The real CLI (see
 # main.rs wait-event/notify) wraps the JSON arg in single quotes for exactly
 # this reason; do the same here since we're driving the wire directly.
-$wireJson = "'" + $json.Replace("'", "'") + "'"
+$wireJson = "'" + $json + "'"
 # drive the wire directly (stale caller has no live pane env):
 $port = Get-Content "$env:USERPROFILE\.psmux\$S.port"; $key = Get-Content "$env:USERPROFILE\.psmux\$S.key"
 $c = New-Object Net.Sockets.TcpClient("127.0.0.1", [int]$port)
@@ -43,10 +43,26 @@ $env:PSMUX_PANE_INSTANCE = $null; $env:PSMUX_SESSION_UID = $null
 & $P notify --done
 if ($LASTEXITCODE -ne 0) { throw "outside notify must exit 0" }
 
+# notify with TMUX_PANE set but PSMUX_PANE_INSTANCE absent: this is the
+# warm-claimed-initial-pane signature (see docs/agent-events.md warm caveat).
+# Must still exit 0 (silent-no-op contract preserved) but print exactly one
+# diagnostic line to stderr so it doesn't read as psmux silently swallowing
+# a real failure.
+$env:TMUX_PANE = "%1"
+$env:PSMUX_PANE_INSTANCE = $null
+$env:PSMUX_SESSION_UID = $null
+$stderrFile = "$env:TEMP\psmux-warm-notify-stderr.txt"
+& $P notify --done 2> $stderrFile
+if ($LASTEXITCODE -ne 0) { throw "warm-claimed-pane notify must exit 0" }
+$stderrText = (Get-Content $stderrFile -Raw)
+if ($stderrText -notmatch "no identity") { throw "expected warm-pane diagnostic on stderr, got: $stderrText" }
+Remove-Item $stderrFile -ErrorAction SilentlyContinue
+$env:TMUX_PANE = $null
+
 # case-folded protected env cannot override TMUX_PANE
-# Panes at this point: %1 (respawned in place, id reused) + %2 (split at
-# line 48 below creates the first NEW pane id since respawn-pane -k reuses
-# the existing slot rather than allocating a new one) — NOT %3.
+# Panes at this point: %1 (respawned in place, id reused) + %2 (split-window
+# below creates the first NEW pane id since respawn-pane -k reuses the
+# existing slot rather than allocating a new one) — NOT %3.
 & $P -t $S set-environment tmux_pane FAKE
 & $P -t $S split-window -d
 Start-Sleep -m 800
