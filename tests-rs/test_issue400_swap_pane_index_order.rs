@@ -43,6 +43,7 @@ fn make_pane(id: usize, rows: u16, cols: u16) -> crate::types::Pane {
         last_rows: rows,
         last_cols: cols,
         id,
+        instance: 0,
         title: format!("pane{id}"),
         title_locked: false,
         child_pid: None,

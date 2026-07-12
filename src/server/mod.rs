@@ -762,6 +762,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // Server starts detached with a reasonable default window size
     app.attached_clients = 0;
 
+    // Mint a real identity immediately for a normal session. Warm (`__warm__`)
+    // servers stay dormant (empty session_uid) until claimed — see
+    // CtrlReq::ClaimSession below, which mints the identity at that point.
+    if !crate::session::is_warm_session(&app.session_name) {
+        app.session_uid = crate::events::gen_uid();
+    }
+
     // ── P0: single-server-per-name guard (issue #2) ─────────────────────────
     // Hold a named mutex keyed on this session's base name for the server's whole
     // life. If another LIVE server already owns the name, we are a duplicate from
@@ -3036,6 +3043,9 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         crate::session::write_session_pid_file(&new_base, std::process::id());
                     }
                     app.session_name = name;
+                    // Server was dormant (empty session_uid) while __warm__; minting
+                    // here activates identity now that it is a real, claimed session.
+                    app.session_uid = crate::events::gen_uid();
                     // Warm server's created_at is the warm process start time, not the
                     // user's session-creation time — reset on claim or list-sessions /
                     // session_created / uptime would report the warm pool's age.

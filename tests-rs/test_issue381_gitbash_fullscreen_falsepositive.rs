@@ -71,6 +71,7 @@ fn make_pane(term: Arc<Mutex<vt100::Parser>>, rows: u16, cols: u16, child_pid: O
         last_rows: rows,
         last_cols: cols,
         id: 0,
+        instance: 0,
         title: "bash".to_string(),
         title_locked: false,
         child_pid,

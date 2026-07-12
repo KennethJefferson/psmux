@@ -89,6 +89,10 @@ pub struct Pane {
     pub last_rows: u16,
     pub last_cols: u16,
     pub id: usize,
+    /// Per-pane identity, unique within this server's lifetime; never reused.
+    /// Popups stay `0` (excluded by design). Warm-transplanted panes get a
+    /// fresh instance but no identity env (spawned pre-claim).
+    pub instance: u64,
     pub title: String,
     /// When true, `infer_title_from_prompt` will not overwrite the title.
     /// Set by `select-pane -T` (explicit title). Cleared by `select-pane -T ""`.
@@ -508,6 +512,12 @@ pub struct AppState {
     /// Sender cloned into each run-shell background thread.
     pub run_shell_tx: Option<mpsc::Sender<(String, String)>>,
     pub session_name: String,
+    /// Unique per-server-lifetime identity, empty while dormant (`__warm__` before claim).
+    pub session_uid: String,
+    /// Monotonic counter for `Pane.instance` allocation; never reused within a server lifetime.
+    pub next_pane_instance: u64,
+    /// Server option: allow event content payloads (Task 5+).
+    pub event_content: bool,
     /// Numeric session ID (tmux-compatible: $0, $1, $2...).
     pub session_id: usize,
     /// -L socket name for namespace isolation (tmux compatible).
@@ -759,6 +769,18 @@ impl AppState {
         self.session_name == "__warm__"
     }
 
+    /// Allocates a fresh, never-reused pane instance id for this server's lifetime.
+    pub fn alloc_pane_instance(&mut self) -> u64 {
+        let i = self.next_pane_instance;
+        self.next_pane_instance += 1;
+        i
+    }
+
+    /// Temporary stub: Task 5 replaces this with the real dormant bus handle id.
+    pub fn bus_id_string(&self) -> String {
+        String::new()
+    }
+
     /// Whether this server should run the periodic `status-interval` timer,
     /// which fires user `status-interval` hooks and re-renders the status line
     /// so time formats (`%H:%M:%S`, `%r`, ...) stay current.
@@ -990,6 +1012,9 @@ impl AppState {
             run_shell_rx: None,
             run_shell_tx: None,
             session_name,
+            session_uid: String::new(),
+            next_pane_instance: 1,
+            event_content: false,
             session_id: crate::session::allocate_session_id(),
             socket_name: None,
             attached_clients: 0,
@@ -1786,3 +1811,7 @@ mod tests_issue434_reap_client;
 #[cfg(test)]
 #[path = "../tests-rs/test_kill_descendants_option.rs"]
 mod tests_kill_descendants_option;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_instance.rs"]
+mod test_pane_instance;

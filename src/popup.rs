@@ -146,6 +146,8 @@ pub fn create_popup_pane(
         last_rows: rows,
         last_cols: cols,
         id: pane_id,
+        // Popups are excluded from the identity/event system by design.
+        instance: 0,
         title: String::new(),
         title_locked: false,
         child_pid,
@@ -212,6 +214,8 @@ pub fn create_empty_pane(rows: u16, cols: u16, pane_id: usize) -> Option<Pane> {
         last_rows: rows,
         last_cols: cols,
         id: pane_id,
+        // Popups are excluded from the identity/event system by design.
+        instance: 0,
         title: String::new(),
         title_locked: false,
         child_pid: None,

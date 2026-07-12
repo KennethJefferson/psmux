@@ -70,6 +70,7 @@ fn make_pane(term: Arc<Mutex<vt100::Parser>>, rows: u16, cols: u16) -> crate::ty
         last_rows: rows,
         last_cols: cols,
         id: 0,
+        instance: 0,
         title: "podman".to_string(),
         title_locked: false,
         child_pid: None,
