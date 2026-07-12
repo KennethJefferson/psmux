@@ -56,6 +56,7 @@ within `--settle-timeout`, it captures anyway and exits nonzero so the caller ca
 | Category | Event names | Fired when |
 |---|---|---|
 | `pane` | `pane-exited` | A pane's process terminates (carries pane id + instance so a later pane reusing the same id can't be confused with this one) |
+| `pane` | `pane-bell` | A bell (`\x07`) is detected in a pane's output (carries pane id + instance) |
 | `window` | `window-created` | A new window is created |
 | `session` | `session-renamed` | The session is renamed |
 | `agent` | `agent-done` | A validated in-pane `notify --done` or an agent hook's turn-complete signal |
@@ -65,6 +66,16 @@ within `--settle-timeout`, it captures anyway and exits nonzero so the caller ca
 
 Filter `psmux events`/`wait-event` by `--name` and/or `--category` to scope what you
 receive.
+
+If your `--after` cursor's `session_uid`/`bus_id` doesn't match this session's bus, the
+subscribe ack shows `"mismatch":true` and the stream immediately closes — the CLI exits 1
+(non-clean close) rather than silently falling back to a live-only stream. A malformed
+`--after` value (fails to parse as `session_uid:bus_id:seq`) gets its own one-line
+`{"type":"error","error":"bad cursor"}` frame before the connection closes, again for the
+same reason: never silently proceed as if `--after` had been omitted. A session bus also
+caps concurrent subscribers at 64 — the 65th `events`/`wait-event` caller gets an ack with
+`"refused":"max_subscribers"` followed by a `closed` frame (`wait-event` reports this as an
+error, non-zero exit) instead of being queued or silently dropped.
 
 ## `notify` and `hook-notify`
 

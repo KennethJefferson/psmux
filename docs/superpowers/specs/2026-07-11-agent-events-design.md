@@ -32,7 +32,13 @@ Identity tokens exist for DETERMINISM (stale-signal rejection), not authenticati
   instance state and rejects mismatches (publishing a `stale-notify` event).
 - The server refuses to start elevated unless `PSMUX_ALLOW_ELEVATED=1`, closing the
   medium-to-elevated escalation path for all commands including the new stream.
-- New code paths get bounded line framing and a pre-auth deadline on connections.
+- New code paths get bounded line framing and a pre-auth deadline on connections. As shipped,
+  `read_line_bounded` (`src/server/connection.rs`) is a single reader (one byte at a time,
+  no internal retry loop across calls) used once per connection to read the `AUTH` line,
+  under one cumulative deadline (5 s) that also bounds the byte cap (1024 B) check — not a
+  per-read or per-command deadline. `Ok(None)` from it means either the cap was exceeded or
+  the deadline expired; callers treat both identically (reject the connection), so the
+  ambiguity is intentional and not a gap.
 - Known pre-existing transport issues (TCP+keyfile readable across integrity boundaries;
   `Local\` mutex vs profile-global registry files across console/RDP logon sessions) are
   documented as a separate hardening workstream (named pipe + DACL +
@@ -57,8 +63,18 @@ Server-minted, never trusted from clients:
 - A delayed hook from a pane's previous process carries the old `pane_instance` and is
   rejected as stale.
 - Warm servers: the bus is dormant until claim; no events from `__warm__` construction; no
-  state keyed by mutable session names. Hook-driven agent panes require cold spawn (warm
-  panes lack instance env; their notifies fail validation — documented).
+  state keyed by mutable session names. As shipped, this only applies to the pre-claim
+  `__warm__` pool server's own initial pane: it was spawned before any real session existed
+  to mint an identity, so `set_tmux_env` had nothing to export and that one pane's `notify`/
+  hook calls stay a silent no-op forever (`WarmPane.minted_instance == None`, see
+  `src/types.rs`). Warm PANE spares replenished by an already-live, already-identified
+  session (a normal `session_uid` already minted) DO carry identity — it was baked in at
+  spawn time and reused verbatim at transplant (`minted_instance == Some(n)`), never
+  reallocated post-spawn. "Hook-driven agent panes require cold spawn" was an overstatement;
+  the accurate rule is: only a session's very first pane, if it came from the pre-claim
+  `__warm__` pool, lacks identity — every pane after that (including replenished warm
+  spares) has it. See docs/agent-events.md "Warm-pane caveat" for the user-facing version
+  and `PSMUX_NO_WARM=1` as the blunt opt-out.
 - Popup panes are excluded from the event/identity system in v1 (documented).
 - Session rename does not reset the bus.
 
@@ -69,39 +85,59 @@ ACL/retention spec.
 
 - Single sequencer: all publishes route through the main state loop and are emitted only
   AFTER the corresponding state mutation commits. Connection threads never mint `seq`.
-- Producers (v1): pane lifecycle (spawned/exited — transition records capture
-  `pane_instance`, exit status, reason BEFORE identity teardown), window/session lifecycle,
-  bell, `agent-done` / `agent-notify` / `stale-notify` (from hooks and `psmux notify`),
-  `bus-closed`. Send/paste producers are explicitly NOT in v1.
+- Producers (v1, as shipped): `pane-exited` (transition records capture `pane_instance`,
+  reason, BEFORE identity teardown), `pane-bell`, `window-created`, `session-renamed`,
+  `agent-done`, `agent-notify`, `stale-notify` (from hooks and `psmux notify`), `bus-closed`.
+  Send/paste producers are explicitly NOT in v1.
 - Subscriber registration under the bus lock: capture cutoff = current seq, register live
   queue, release. Writer emits ack frame → replay (filtered, seq ≤ cutoff, streamed from
-  the 4096-event ring) → live events (seq > cutoff) from a 1024-slot bounded queue. Filters
+  the 4096-event ring) → live events (seq > cutoff) from a bounded queue. Filters
   apply before enqueue. Replay never passes through the live queue.
-- Limits enforced before fanout: 16 KiB serialized event cap (oversize → payload replaced
-  with `{truncated:true}` + counters), per-pane and global publish rate limits, max
-  subscriber count, bounded per-subscriber socket-write deadline with cancellation. Slow
-  consumers are closed with a terminal `slow_consumer` error frame; others unaffected.
-- Ack frame: `{session_uid, bus_id, oldest_seq, latest_seq, replay_count, gap, gap_reason}`.
-- Heartbeat frame every 15 s (client-suppressible).
-- Shutdown: one idempotent server-shutdown path (used by kill-server and last-session exit;
-  existing direct `std::process::exit` sites in server code are routed through it):
-  publish terminal `bus-closed`, stop accepts, close subscriber queues with terminal
-  reason, join writers with deadline, then exit. Event subscribers do not keep exit-empty
-  sessions alive. Hard kill/panic excluded (documented).
+- Limits enforced before fanout, as shipped: 16 KiB serialized event cap (oversize →
+  payload replaced with `{truncated:true}`), an 8192-slot bounded per-subscriber channel
+  with `try_send`-and-drop on a full queue (the "slow_consumer" path below), and a 64
+  concurrent-subscriber cap per bus (`MAX_SUBSCRIBERS`, `src/events.rs`) — the 65th
+  `subscribe()` call is refused registration (ack carries `"refused":"max_subscribers"`,
+  no replay, connection closes) rather than growing `subs` unbounded. Slow consumers (full
+  channel on `try_send`) are dropped and sent a terminal `slow_consumer` frame; other
+  subscribers are unaffected. Per-pane/global publish RATE limits and a bounded
+  per-subscriber socket-write deadline with cancellation are explicitly DEFERRED to
+  increment 2 — not part of the v1 surface described here.
+- Ack frame (as shipped): `{type, session_uid, bus_id, oldest_seq, latest_seq,
+  replay_count, gap, gap_reason, mismatch, refused}` — `refused` is `null` unless the
+  64-subscriber cap rejected this registration, in which case it's the string
+  `"max_subscribers"`.
+- Heartbeat frame every 15 s (client-suppressible client-side, not server-gated).
+- Shutdown: one idempotent server-shutdown path, `shutdown_server(app, reason)` in
+  `src/server/mod.rs`, called from every exit site with a reason specific to that site —
+  `"kill-server"`, `"detach-exit"`, `"session-teardown"`, `"exit-empty"` — not a single
+  generic reason. Each call: publish terminal `bus-closed` (payload carries that same
+  `reason`), close subscriber queues with the terminal frame, remove the port/key files,
+  then exit. Event subscribers do not keep exit-empty sessions alive. Hard kill/panic
+  excluded (documented).
 
 ## 5. CLI verbs and the synchronization contract
 
 - `psmux events [--name X]... [--category Y]... [--after '<session_uid>:<bus_id>:<seq>']
   [--no-heartbeat] [--json]` — long-lived subscribe stream (ack/replay/live/heartbeat/
-  terminal frames as JSON lines). Terminal frames (`bus-closed`, `slow_consumer`) are
-  distinguishable from transport loss by exit code. `--cursor-file`/`--reconnect` are
-  increment 2 (alongside the disk log).
+  terminal frames as JSON lines). The ack frame carries a `mismatch` field: when
+  `--after`'s `session_uid`/`bus_id` doesn't match this bus, `mismatch:true` is written
+  and the stream closes immediately (no replay, no live events) — the CLI's non-clean-close
+  detection then exits 1. A malformed (unparseable) `--after` value gets a dedicated
+  `{"type":"error","error":"bad cursor"}` frame instead of silently falling back to a
+  live-only stream, then the connection closes. Terminal frames (`bus-closed`,
+  `slow_consumer`, and now `closed` with `reason:"max_subscribers"` when the 64-subscriber
+  cap refuses registration) are distinguishable from transport loss by exit code.
+  `--cursor-file`/`--reconnect` are increment 2 (alongside the disk log).
 - `psmux cursor [--json]` — prints the current `{session_uid, bus_id, seq}` cursor.
-- `psmux wait-event --pane %N [--instance G] [--name agent-done] --after <cursor>
-  --timeout <ms> [--json]` — ONE-SHOT: subscribes with the atomic cutoff contract, scans
-  the replay window after `<cursor>` (catching completion-before-wait), then blocks.
-  Exit 0 + event JSON on match; distinct nonzero codes for timeout / cursor gap /
-  bus mismatch / session-ended.
+- `psmux wait-event --pane %N [--instance G] [--name agent-done] [--after <cursor>]
+  --timeout <ms> [--json]` — ONE-SHOT: `--after` is OPTIONAL as shipped (omitting it
+  subscribes live-only, matching `events-subscribe`'s own `None` semantics — there is no
+  requirement to always pass a cursor). When given, subscribes with the atomic cutoff
+  contract, scans the replay window after `<cursor>` (catching completion-before-wait),
+  then blocks. Exit 0 + event JSON on match; distinct nonzero codes for timeout (2) /
+  cursor gap (3) / bus mismatch (4) / session-ended (5); a refused (max-subscribers)
+  registration surfaces as a generic error exit (1), same bucket as any other `ERR:` reply.
 - The race-free dispatch recipe (cursor → dispatch → wait-event) is THE documented
   contract; there is no subscribe-before-dispatch ordering requirement because the cursor
   is the commitment point.
@@ -186,12 +222,24 @@ respawn-pane with delayed old-instance hook rejected as stale; atomic cutoff —
 duplication across the replay/live boundary under concurrent publish; cursor gap / bus_id
 mismatch / session-ended distinct exit codes; blocked subscriber → `slow_consumer` close
 with others unaffected; oversize event truncation; warm-server claim (no pre-claim events,
-correct `session_uid`) and two concurrent warm servers; session rename does not reset the
-bus; hook fires mid-frame → `capture-pane --settle` returns the complete screen; spoofed
-`PSMUX_PANE_INSTANCE` rejected; elevated-server refusal; case-folded env protection
+correct `session_uid`) and two concurrent warm servers [DEFERRED — no automated coverage
+shipped in v1; single warm-server claim is covered by the stale/e2e suites, but the
+two-concurrent-warm-servers interleaving is not exercised by any test in this repo as of
+this writing]; session rename does not reset the bus; hook fires mid-frame →
+`capture-pane --settle` returns the complete screen (as shipped, this also required fixing
+`capture-pane -t %N --settle` to resolve and probe the actual `-t` target instead of
+whatever pane happens to be active — see the `PaneDataVersion(Option<usize>, ...)` fix);
+spoofed `PSMUX_PANE_INSTANCE` rejected; elevated-server refusal; case-folded env protection
 (`tmux_pane=x` cannot override); installer: concurrent install, reinstall/upgrade,
 uninstall restores, foreign hooks preserved; server shutdown with active subscribers →
-terminal frames + flush; pre-auth slow-loris dropped at deadline; bounded line framing.
+terminal frames + flush; pre-auth slow-loris dropped at deadline; bounded line framing;
+malformed `--after` cursor → dedicated `bad cursor` error frame (not silent live-only
+fallback); 64-subscriber cap refuses the 65th registration. Cutoff-under-concurrent-publish
+stress specifically [DEFERRED — the atomic-cutoff *logic* is covered by
+`subscribe_replays_filtered_after_cursor`/`live_events_reach_subscriber_after_subscribe` in
+`tests-rs/test_agent_events_bus.rs`, but there is no dedicated stress test that publishes
+concurrently from multiple threads while subscribing, to catch a race the single-threaded
+unit tests can't surface].
 
 ## 11. Increments
 
@@ -203,8 +251,32 @@ terminal frames + flush; pre-auth slow-loris dropped at deadline; bounded line f
 3. OSC untrusted `pane-notify` (FIFO staging, drain-before-reap) + `--env-file` + `-J`
    audit.
 
+Follow-ups identified during the final-review fix-up pass (not yet scheduled to a specific
+increment above):
+- PID-scoped `kill_remaining_server_processes` (`src/session.rs`): today it is a broad
+  nuclear fallback used by `kill-server`, not scoped to the specific server this client is
+  talking to. Scope it to the target session's own process (and its known child PIDs) so a
+  `kill-server` on one session can't have any chance of reaping an unrelated psmux server
+  process on the same machine.
+- Warm-claim identity injection: `silent_rehome` (`src/pane.rs`) rewrites a transplanted
+  pane's cwd/env at claim time but does not mint or inject identity env for the one case
+  that truly lacks it — a session's very first pane, claimed from the pre-claim `__warm__`
+  pool (see §3). A `silent_rehome`-style targeted env injection at warm-claim time, scoped
+  to just that one gap, would close it without touching the (correctly identity-bearing)
+  warm PANE-spare replenishment path.
+- `gap_reason` constants: `EventBus::subscribe` (`src/events.rs`) currently builds a
+  free-form `String` ad hoc at each call site ("cursor older than retained ring", "cursor
+  newer than latest"). Promote these to named constants (or a small enum with
+  `Display`/`as_str`) so callers and tests don't rely on exact prose matching, and so new
+  gap reasons can't accidentally collide with or subtly restate an existing one.
+
 ## 12. Deferred by decision (user call, 2026-07-11)
 
 - Full transport-security rework (named pipe + DACL + client-PID verification; logon-
   session-scoped registry) — revisit if it presents a problem in practice.
 - GSU round-2 formal re-grade of the revision — skipped; round-1 findings incorporated.
+- Concurrent warm servers and cutoff-under-concurrent-publish stress test coverage (§10):
+  the interleaving/race scenarios themselves are architecturally handled (dormant bus
+  until claim; subscribe-under-lock cutoff capture), but no automated test in this repo
+  drives either scenario under actual concurrency as of this fix-up pass — see the §10
+  annotations for exactly what is and isn't covered today.
