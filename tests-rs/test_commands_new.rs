@@ -1617,9 +1617,12 @@ fn run_shell_captures_and_displays_output() {
 
     // run-shell is now async: the command runs in a background thread
     // and sends output via run_shell_rx. We need to recv the result.
+    // 30s bound: with the new-session unit tests short-circuited the full
+    // suite runs in seconds, so this PowerShell cold-start now happens under
+    // saturated CPU; 10s was measured too tight in full-suite runs.
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
-        .expect("should receive run-shell output within 10s");
+    let (title, text) = rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("should receive run-shell output within 30s");
     assert_eq!(title, "run-shell");
     assert!(
         text.contains("hello-from-run-shell"),
@@ -1658,8 +1661,8 @@ fn run_shell_alias_captures_output() {
     let _ = execute_command_string(&mut app, cmd);
 
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
-        .expect("should receive run alias output within 10s");
+    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("should receive run alias output within 30s");
     assert!(
         text.contains("alias-test"),
         "run alias should also capture output, got: {}",
@@ -1679,8 +1682,8 @@ fn run_shell_stderr_is_captured() {
     let _ = execute_command_string(&mut app, cmd);
 
     let rx = app.run_shell_rx.as_ref().expect("run_shell_rx should be created");
-    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(10))
-        .expect("should receive run-shell stderr output within 10s");
+    let (_title, text) = rx.recv_timeout(std::time::Duration::from_secs(30))
+        .expect("should receive run-shell stderr output within 30s");
     assert!(
         text.contains("error-output") || text.contains("error"),
         "run-shell should capture stderr, got: {}",

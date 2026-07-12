@@ -31,8 +31,8 @@ pub fn cache_key(sess: &str, win_id: usize, pane_id: usize) -> String {
 ///
 /// `pane_id == usize::MAX` => target the window only (server captures the
 /// active pane). Otherwise targets a specific pane id within the window.
-pub fn fetch_pane_preview(home: &str, sess: &str, win_id: usize, pane_id: usize) -> Option<String> {
-    let port_path = format!("{}\\.psmux\\{}.port", home, sess);
+pub fn fetch_pane_preview(sess: &str, win_id: usize, pane_id: usize) -> Option<String> {
+    let port_path = format!("{}\\{}.port", crate::session::registry_dir(), sess);
     let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
     let key = read_session_key(sess).ok()?;
     let target = if pane_id == usize::MAX {
@@ -60,7 +60,6 @@ pub fn fetch_pane_preview(home: &str, sess: &str, win_id: usize, pane_id: usize)
 /// Get a preview, using the cache if fresh, fetching otherwise.
 pub fn get_or_fetch(
     cache: &mut PreviewCache,
-    home: &str,
     sess: &str,
     win_id: usize,
     pane_id: usize,
@@ -71,7 +70,7 @@ pub fn get_or_fetch(
             return Some(text.clone());
         }
     }
-    let text = fetch_pane_preview(home, sess, win_id, pane_id)?;
+    let text = fetch_pane_preview(sess, win_id, pane_id)?;
     cache.insert(key, (text.clone(), Instant::now()));
     Some(text)
 }
@@ -284,8 +283,8 @@ pub type LayoutCache = HashMap<String, (LayoutSimple, Instant)>;
 pub const LAYOUT_TTL: Duration = Duration::from_millis(2500);
 
 /// Fetch the simplified layout for a window in any session via TCP.
-pub fn fetch_window_layout(home: &str, sess: &str, win_id: usize) -> Option<LayoutSimple> {
-    let port_path = format!("{}\\.psmux\\{}.port", home, sess);
+pub fn fetch_window_layout(sess: &str, win_id: usize) -> Option<LayoutSimple> {
+    let port_path = format!("{}\\{}.port", crate::session::registry_dir(), sess);
     let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
     let key = read_session_key(sess).ok()?;
     let cmd = format!("window-layout {}\n", win_id);
@@ -305,7 +304,6 @@ pub fn fetch_window_layout(home: &str, sess: &str, win_id: usize) -> Option<Layo
 
 pub fn get_or_fetch_layout(
     cache: &mut LayoutCache,
-    home: &str,
     sess: &str,
     win_id: usize,
 ) -> Option<LayoutSimple> {
@@ -315,7 +313,7 @@ pub fn get_or_fetch_layout(
             return Some(layout.clone());
         }
     }
-    let layout = fetch_window_layout(home, sess, win_id)?;
+    let layout = fetch_window_layout(sess, win_id)?;
     cache.insert(key, (layout.clone(), Instant::now()));
     Some(layout)
 }
@@ -461,8 +459,8 @@ pub const DUMP_TTL: Duration = Duration::from_millis(1500);
 
 /// Fetch the full styled layout (rows_v2) for a window in any session
 /// via TCP using the new `window-dump` command.
-pub fn fetch_window_dump(home: &str, sess: &str, win_id: usize) -> Option<crate::layout::LayoutJson> {
-    let port_path = format!("{}\\.psmux\\{}.port", home, sess);
+pub fn fetch_window_dump(sess: &str, win_id: usize) -> Option<crate::layout::LayoutJson> {
+    let port_path = format!("{}\\{}.port", crate::session::registry_dir(), sess);
     let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
     let key = read_session_key(sess).ok()?;
     let cmd = format!("window-dump {}\n", win_id);
@@ -482,7 +480,6 @@ pub fn fetch_window_dump(home: &str, sess: &str, win_id: usize) -> Option<crate:
 
 pub fn get_or_fetch_dump(
     cache: &mut DumpCache,
-    home: &str,
     sess: &str,
     win_id: usize,
 ) -> Option<crate::layout::LayoutJson> {
@@ -492,7 +489,7 @@ pub fn get_or_fetch_dump(
             return Some(layout.clone());
         }
     }
-    let layout = fetch_window_dump(home, sess, win_id)?;
+    let layout = fetch_window_dump(sess, win_id)?;
     cache.insert(key, (layout.clone(), Instant::now()));
     Some(layout)
 }

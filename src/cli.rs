@@ -197,6 +197,13 @@ DISPLAY COMMANDS:
     if-shell, if            Conditional command execution
     wait-for, wait          Wait for / signal a named channel
 
+AGENT EVENTS COMMANDS:
+    cursor                     Print the event-bus cursor (session:bus:seq)
+    events                     Stream events as JSON lines (--name/--category/--after)
+    wait-event                 Block until a matching event (--pane/--name/--after/--timeout)
+    notify                     Publish an agent event from inside a pane (--done)
+    hook-notify                Agent hook entrypoint (reads stdin, prints {{}})
+
 MISC:
     help                    Show this help message
     version                 Show version information
@@ -442,14 +449,17 @@ pub fn print_commands() {
   clock-mode                - Display a large clock in current pane
   confirm-before (confirm)  - Run command after confirmation
   copy-mode                 - Enter copy mode
+  cursor                    - Print the event-bus cursor (session:bus:seq)
   delete-buffer             - Delete a paste buffer
   detach-client (detach)    - Detach from the current session
   display-menu (menu)       - Display a menu
   display-message           - Display a message in the status line
   display-panes             - Display pane numbers
   display-popup (popup)     - Display a popup window
+  events                    - Stream events as JSON lines (--name/--category/--after)
   find-window (findw)       - Search for a window by name
   has-session               - Check if a session exists
+  hook-notify               - Agent hook entrypoint (reads stdin, prints {{}})
   if-shell (if)             - Conditional command execution
   join-pane                 - Join a pane to a window
   kill-pane                 - Kill a pane
@@ -474,6 +484,7 @@ pub fn print_commands() {
   new-window (neww)         - Create a new window
   next-layout (nextl)       - Cycle to next layout
   next-window (next)        - Move to the next window
+  notify                    - Publish an agent event from inside a pane (--done)
   paste-buffer              - Paste from a buffer
   pipe-pane (pipep)         - Pipe pane output to a command
   previous-window (prev)    - Move to the previous window
@@ -507,6 +518,7 @@ pub fn print_commands() {
   switch-client (switchc)   - Switch to another session
   unbind-key (unbind)       - Unbind a key
   unlink-window (unlinkw)   - Unlink a window
+  wait-event                - Block until a matching event (--pane/--name/--after/--timeout)
   wait-for (wait)           - Wait for a signal
   zoom-pane (zoom)          - Toggle pane zoom
 "#);

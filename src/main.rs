@@ -34,6 +34,8 @@ mod control;
 mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
+mod events;
+mod hooks_install;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -166,8 +168,7 @@ fn cli_pane_index_exists(idx_spec: &str) -> Option<bool> {
 /// returns true — conservative on purpose, so a busy server is never wrongly
 /// declared dead (used by kill-session to decide when the kill has landed).
 fn probe_session_alive(session_name: &str) -> bool {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let path = format!("{}\\.psmux\\{}.port", home, session_name);
+    let path = format!("{}\\{}.port", crate::session::registry_dir(), session_name);
     let port = match std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()) {
         Some(p) => p,
         None => return false, // no port file → gone
@@ -319,8 +320,7 @@ fn run_main() -> io::Result<()> {
         // (set inside every psmux pane) names the current server; the `-L`
         // namespace and the most-recent-session fallback are applied inside
         // resolve_routing_target.
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-        let psmux_dir = std::path::PathBuf::from(format!("{}\\.psmux", home));
+        let psmux_dir = std::path::PathBuf::from(crate::session::registry_dir().to_string());
         let tmux_env = env::var("TMUX").ok();
         if let Some(name) = crate::session::resolve_routing_target(
             l_socket_name.as_deref(),
@@ -400,8 +400,7 @@ fn run_main() -> io::Result<()> {
             let win_id: usize = cmd_args[2].parse().expect("win_id must be a number");
             let w: u16 = cmd_args[3].parse().expect("width must be a number");
             let h: u16 = cmd_args[4].parse().expect("height must be a number");
-            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            let layout = match crate::preview::fetch_window_dump(&home, &sess, win_id) {
+            let layout = match crate::preview::fetch_window_dump(&sess, win_id) {
                 Some(l) => l,
                 None => { eprintln!("failed to fetch window-dump for {}:@{}", sess, win_id); std::process::exit(3); }
             };
@@ -461,8 +460,7 @@ fn run_main() -> io::Result<()> {
     match cmd {
         // kill-server MUST be handled early before any potential fall-through
         "kill-server" => {
-            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            let psmux_dir = format!("{}\\.psmux", home);
+            let psmux_dir = crate::session::registry_dir().to_string();
             // Compute namespace prefix for -L filtering (matches list-sessions behavior)
             let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
             let mut targets: Vec<(std::path::PathBuf, u16, String)> = Vec::new();
@@ -571,8 +569,7 @@ fn run_main() -> io::Result<()> {
                         i += 1;
                     }
                 }
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let dir = format!("{}\\.psmux", home);
+                let dir = crate::session::registry_dir().to_string();
                 // Compute namespace prefix for -L filtering
                 let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
                 if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -619,7 +616,7 @@ fn run_main() -> io::Result<()> {
                                                 // while still detecting dead sessions quickly.
                                                 let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
                                                 // Read session key and authenticate
-                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
+                                                let key_path = format!("{}\\{}.key", crate::session::registry_dir(), base);
                                                 if let Ok(key) = std::fs::read_to_string(&key_path) {
                                                     let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
                                                 }
@@ -957,8 +954,7 @@ fn run_main() -> io::Result<()> {
                 };
                 
                 // Check if session already exists AND is actually running
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
+                let port_path = format!("{}\\{}.port", crate::session::registry_dir(), port_file_base);
                 // PID of the server we spawn on the cold path (None when we adopt
                 // a warm server or attach to a remote one). The readiness gate
                 // below uses it to fail fast if the freshly spawned server dies.
@@ -1012,7 +1008,7 @@ fn run_main() -> io::Result<()> {
                     } else {
                         "__warm__".to_string()
                     };
-                    let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+                    let warm_port_path = format!("{}\\{}.port", crate::session::registry_dir(), warm_base);
                     // Atomically CLAIM the warm server before connecting. The
                     // __warm__.port file is a shared handoff: under rapid
                     // new-session, several clients could read the SAME file (and
@@ -1023,7 +1019,7 @@ fn run_main() -> io::Result<()> {
                     let warm_port_opt = std::fs::read_to_string(&warm_port_path)
                         .ok()
                         .and_then(|s| s.trim().parse::<u16>().ok());
-                    let claim_path = format!("{}\\.psmux\\{}.claiming.{}", home, warm_base, std::process::id());
+                    let claim_path = format!("{}\\{}.claiming.{}", crate::session::registry_dir(), warm_base, std::process::id());
                     if let Some(warm_port) = warm_port_opt {
                         if std::fs::rename(&warm_port_path, &claim_path).is_ok() {
                             let warm_addr = format!("127.0.0.1:{}", warm_port);
@@ -1518,6 +1514,18 @@ fn run_main() -> io::Result<()> {
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
+                        "--settle" => {
+                            if let Some(v) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -W {}", v));
+                                i += 1;
+                            }
+                        }
+                        "--settle-timeout" => {
+                            if let Some(v) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -Y {}", v));
+                                i += 1;
+                            }
+                        }
                         "-t" => {
                             if let Some(target) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -t {}", target));
@@ -1586,6 +1594,10 @@ fn run_main() -> io::Result<()> {
                 cmd.push('\n');
                 if print_stdout {
                     let resp = send_control_with_response(cmd)?;
+                    if let Some(rest) = resp.strip_prefix("SETTLE-TIMEOUT\n") {
+                        print!("{}", rest);
+                        std::process::exit(1);
+                    }
                     print!("{}", resp);
                 } else {
                     send_control(cmd)?;
@@ -1784,8 +1796,7 @@ fn run_main() -> io::Result<()> {
 
                 if all_sessions {
                     // Iterate over all session port files (like list-sessions does)
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let dir = format!("{}\\.psmux", home);
+                    let dir = crate::session::registry_dir().to_string();
                     let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
                     if let Ok(entries) = std::fs::read_dir(&dir) {
                         for e in entries.flatten() {
@@ -1808,7 +1819,7 @@ fn run_main() -> io::Result<()> {
                                             let refused = matches!(&conn, Err(e) if e.kind() == io::ErrorKind::ConnectionRefused);
                                             if let Ok(mut s) = conn {
                                                 let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
+                                                let key_path = format!("{}\\{}.key", crate::session::registry_dir(), base);
                                                 if let Ok(key) = std::fs::read_to_string(&key_path) {
                                                     let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
                                                 }
@@ -1904,8 +1915,7 @@ fn run_main() -> io::Result<()> {
 
                 if all_sessions {
                     // Iterate over all session port files (like list-sessions does)
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let dir = format!("{}\\.psmux", home);
+                    let dir = crate::session::registry_dir().to_string();
                     let ns_prefix = l_socket_name.as_ref().map(|l| format!("{l}__"));
                     if let Ok(entries) = std::fs::read_dir(&dir) {
                         for e in entries.flatten() {
@@ -1928,7 +1938,7 @@ fn run_main() -> io::Result<()> {
                                             let refused = matches!(&conn, Err(e) if e.kind() == io::ErrorKind::ConnectionRefused);
                                             if let Ok(mut s) = conn {
                                                 let _ = s.set_read_timeout(Some(Duration::from_millis(500)));
-                                                let key_path = format!("{}\\.psmux\\{}.key", home, base);
+                                                let key_path = format!("{}\\{}.key", crate::session::registry_dir(), base);
                                                 if let Ok(key) = std::fs::read_to_string(&key_path) {
                                                     let _ = std::io::Write::write_all(&mut s, format!("AUTH {}\n", key.trim()).as_bytes());
                                                 }
@@ -2140,8 +2150,7 @@ fn run_main() -> io::Result<()> {
                 // reliable. Crucially, a mere timeout must NOT be treated as
                 // "server dead" — that used to delete a live-but-busy server's
                 // port file, orphaning it and triggering relaunch storms.
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
+                let port_path = format!("{}\\{}.port", crate::session::registry_dir(), session_name);
                 let deadline = std::time::Instant::now() + Duration::from_secs(5);
                 let mut gone = !probe_session_alive(&session_name);
                 let mut refused = false;
@@ -2202,8 +2211,7 @@ fn run_main() -> io::Result<()> {
                 if crate::session::is_warm_session(&target) {
                     std::process::exit(1);
                 }
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let path = format!("{}\\.psmux\\{}.port", home, target);
+                let path = format!("{}\\{}.port", crate::session::registry_dir(), target);
                 if let Ok(port_str) = std::fs::read_to_string(&path) {
                     if let Ok(port) = port_str.trim().parse::<u16>() {
                         let addr = format!("127.0.0.1:{}", port);
@@ -3586,13 +3594,12 @@ fn run_main() -> io::Result<()> {
                 // Pre-spawn a warm __warm__ server so the next new-session is
                 // instant.  Also triggers Windows Defender's scan cache on the
                 // binary, eliminating the ~200-400ms first-run penalty.
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
                 let warm_base = if let Some(ref l) = l_socket_name {
                     format!("{}____warm__", l)
                 } else {
                     "__warm__".to_string()
                 };
-                let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+                let warm_port_path = format!("{}\\{}.port", crate::session::registry_dir(), warm_base);
                 // Check if warm server is already running
                 let already_running = if std::path::Path::new(&warm_port_path).exists() {
                     if let Ok(port_str) = std::fs::read_to_string(&warm_port_path) {
@@ -3748,6 +3755,185 @@ fn run_main() -> io::Result<()> {
                 send_control("unlink-window\n".to_string())?;
                 return Ok(());
             }
+            // cursor - Print the current event-bus cursor (session:bus:seq)
+            "cursor" => {
+                let resp = send_control_with_response("events-cursor\n".to_string())?;
+                let out = resp.trim();
+                println!("{}", out);
+                if out.starts_with("ERR") {
+                    return Err(io::Error::new(io::ErrorKind::Other, "bus dormant"));
+                }
+                return Ok(());
+            }
+            // wait-event - Block until a matching event, or a bus outcome (timeout/gap/mismatch/ended)
+            "wait-event" => {
+                let mut pane: Option<u64> = None;
+                let mut inst: Option<u64> = None;
+                let mut name: Option<String> = None;
+                let mut after: Option<String> = None;
+                let mut timeout: u64 = 60_000;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "--pane" => { i += 1; pane = cmd_args.get(i).and_then(|s| s.trim_start_matches('%').parse().ok()); }
+                        "--instance" => { i += 1; inst = cmd_args.get(i).and_then(|s| s.parse().ok()); }
+                        "--name" => { i += 1; name = cmd_args.get(i).map(|s| s.to_string()); }
+                        "--after" => { i += 1; after = cmd_args.get(i).map(|s| s.to_string()); }
+                        "--timeout" => { i += 1; timeout = cmd_args.get(i).and_then(|s| s.parse().ok()).unwrap_or(60_000); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                // AMENDMENT 1: never send a present-but-null "after" — the server
+                // treats that as a bad cursor. Only insert keys that have a value.
+                let mut req = serde_json::Map::new();
+                if let Some(p) = pane { req.insert("pane_id".to_string(), serde_json::json!(p)); }
+                if let Some(g) = inst { req.insert("pane_instance".to_string(), serde_json::json!(g)); }
+                if let Some(ref n) = name { req.insert("name".to_string(), serde_json::json!(n)); }
+                if let Some(ref a) = after { req.insert("after".to_string(), serde_json::json!(a)); }
+                req.insert("timeout_ms".to_string(), serde_json::json!(timeout));
+                let json = serde_json::Value::Object(req).to_string();
+                // AMENDMENT 2: the wire tokenizer strips unescaped double quotes but
+                // treats single-quoted spans as literal, so wrap the JSON arg in
+                // single quotes; escape any embedded single quote as the JSON-legal
+                // ' so it can't prematurely close the quoted span.
+                let json = json.replace('\'', "\\u0027");
+                let resp = session::send_control_with_response_timeout(
+                    format!("wait-event '{}'\n", json), timeout + 10_000)?;
+                let reply = resp.trim();
+                println!("{}", reply);
+                std::process::exit(wait_event_exit_code(reply));
+            }
+            // events - Stream events as JSON lines until a terminal frame
+            "events" => {
+                let mut wire = String::from("events-subscribe");
+                let mut show_heartbeat = true;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "--name" => { i += 1; if let Some(v) = cmd_args.get(i) { wire.push_str(&format!(" name={}", v)); } }
+                        "--category" => { i += 1; if let Some(v) = cmd_args.get(i) { wire.push_str(&format!(" category={}", v)); } }
+                        "--after" => { i += 1; if let Some(v) = cmd_args.get(i) { wire.push_str(&format!(" after={}", v)); } }
+                        "--no-heartbeat" => { show_heartbeat = false; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                wire.push('\n');
+                let clean_stop = session::stream_control_lines(wire, |line| {
+                    if !show_heartbeat && line.contains("\"type\":\"heartbeat\"") { return true; }
+                    println!("{}", line);
+                    !line.contains("\"type\":\"closed\"")
+                })?;
+                // Exit 0 only when the stream ended via the terminal closed
+                // frame (the callback stopped it). EOF/timeout/read error
+                // before that is a transport loss and must exit nonzero.
+                if !clean_stop {
+                    eprintln!("psmux: events stream lost");
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
+            // notify - Publish an agent event from inside a pane (silent no-op outside psmux)
+            "notify" => {
+                let mut name = "agent-notify".to_string();
+                let mut title = String::new();
+                let mut content: Option<String> = None;
+                let mut include_content = false;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "--done" => name = "agent-done".to_string(),
+                        "--name" => { i += 1; if let Some(v) = cmd_args.get(i) { name = v.to_string(); } }
+                        "--title" => { i += 1; if let Some(v) = cmd_args.get(i) { title = v.to_string(); } }
+                        "--include-content" => include_content = true,
+                        "--content" => { i += 1; content = cmd_args.get(i).map(|s| s.to_string()); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let env = NotifyEnv::from_process_env();
+                if env.pane_instance.is_none() || env.session_uid.is_empty() {
+                    warn_if_warm_claimed_pane();
+                    // Outside psmux (or a warm/pre-spawned pane): silent no-op success.
+                    return Ok(());
+                }
+                // Truncate by char count, not byte index, to avoid slicing on a
+                // UTF-8 boundary (the server re-truncates to 4096 chars anyway;
+                // this just avoids sending more than necessary over the wire).
+                let truncated: Option<String> = if include_content {
+                    content.as_deref().map(|s| s.chars().take(4096).collect())
+                } else {
+                    None
+                };
+                let c = truncated.as_deref();
+                let json = build_notify_json(&env, &name, title.len(), c);
+                let json = json.replace('\'', "\\u0027");
+                // Bounded-sync: 2000 ms total; failures are swallowed (always exit 0).
+                let _ = session::send_control_with_response_timeout(
+                    format!("notify-event '{}'\n", json), 2_000);
+                return Ok(());
+            }
+            // hook-notify - Agent hook entrypoint (reads stdin, always prints "{}", always exits 0)
+            "hook-notify" => {
+                let agent = cmd_args.get(1).map(|s| s.to_string()).unwrap_or_default();
+                let event = cmd_args.get(2).map(|s| s.to_string()).unwrap_or_default();
+                // Always satisfy the agent hook contract no matter what happens below.
+                let mut stdin_buf = String::new();
+                {
+                    let _ = std::io::stdin().take(1024 * 1024).read_to_string(&mut stdin_buf);
+                }
+                let env = NotifyEnv::from_process_env();
+                let disabled = std::env::var("PSMUX_HOOKS_DISABLED").ok().as_deref() == Some("1");
+                if !disabled && env.pane_instance.is_some() && !env.session_uid.is_empty() {
+                    let name = parse_hook_event_name(&agent, &event);
+                    let json = build_notify_json(&env, name, 0, None);
+                    let json = json.replace('\'', "\\u0027");
+                    let _ = session::send_control_with_response_timeout(
+                        format!("notify-event '{}'\n", json), 2_000);
+                } else if !disabled {
+                    warn_if_warm_claimed_pane();
+                }
+                println!("{{}}");
+                return Ok(());
+            }
+            // hooks - Install/uninstall/status the Claude Code hook wiring in settings.json
+            "hooks" => {
+                let sub = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
+                let agent = cmd_args.get(2).map(|s| s.as_str()).unwrap_or("");
+                if agent != "claude" {
+                    eprintln!("psmux hooks: only 'claude' is supported in this version");
+                    std::process::exit(1);
+                }
+                let project_local = cmd_args.iter().any(|a| a.as_str() == "--project-local");
+                let settings = if project_local {
+                    std::path::PathBuf::from(".claude").join("settings.local.json")
+                } else {
+                    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+                    std::path::Path::new(&home).join(".claude").join("settings.json")
+                };
+                match sub {
+                    "install" => {
+                        let exe = std::env::current_exe()?;
+                        let r = hooks_install::install_claude(&settings, &exe)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        println!("claude hooks: {}{}",
+                            if r.changed { "installed" } else { "already installed" },
+                            r.backup.map(|b| format!(" (backup: {})", b.display())).unwrap_or_default());
+                    }
+                    "uninstall" => {
+                        let r = hooks_install::uninstall_claude(&settings)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        println!("claude hooks: {}", if r.changed { "removed" } else { "nothing to remove" });
+                    }
+                    "status" | "doctor" => println!("{}", hooks_install::status_claude(&settings)),
+                    _ => {
+                        eprintln!("usage: psmux hooks <install|uninstall|status> claude [--project-local]");
+                        std::process::exit(1);
+                    }
+                }
+                return Ok(());
+            }
             _ => {
                 // Unknown command - print error and exit
                 if !cmd.is_empty() {
@@ -3767,7 +3953,6 @@ fn run_main() -> io::Result<()> {
     // starts the server and creates a session automatically; we do the same.
 
     if env::var("PSMUX_REMOTE_ATTACH").ok().as_deref() != Some("1") {
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
         let session_name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| {
             crate::session::next_session_name(l_socket_name.as_deref())
         });
@@ -3776,7 +3961,7 @@ fn run_main() -> io::Result<()> {
         } else {
             session_name.clone()
         };
-        let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
+        let port_path = format!("{}\\{}.port", crate::session::registry_dir(), port_file_base);
 
         // Try warm server claim first (fast path)
         // Skipped when PSMUX_NO_WARM=1 is set or config has 'set -g warm off'.
@@ -3787,7 +3972,7 @@ fn run_main() -> io::Result<()> {
         } else {
             "__warm__".to_string()
         };
-        let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+        let warm_port_path = format!("{}\\{}.port", crate::session::registry_dir(), warm_base);
         let mut warm_claimed = false;
         // Atomically CLAIM the warm server before connecting (see the detached
         // path above for the full rationale): renaming the shared __warm__.port
@@ -3797,7 +3982,7 @@ fn run_main() -> io::Result<()> {
         let warm_port_opt = if warm_disabled { None } else {
             std::fs::read_to_string(&warm_port_path).ok().and_then(|s| s.trim().parse::<u16>().ok())
         };
-        let warm_claim_path = format!("{}\\.psmux\\{}.claiming.{}", home, warm_base, std::process::id());
+        let warm_claim_path = format!("{}\\{}.claiming.{}", crate::session::registry_dir(), warm_base, std::process::id());
         if let Some(port) = warm_port_opt {
             if std::fs::rename(&warm_port_path, &warm_claim_path).is_ok() {
             let warm_key = crate::session::read_session_key(&warm_base).unwrap_or_default();
@@ -3984,8 +4169,7 @@ fn run_main() -> io::Result<()> {
             env::remove_var("PSMUX_SWITCH_TO");
             env::set_var("PSMUX_SESSION_NAME", &switch_to);
             // Update last_session file
-            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-            let last_path = format!("{}\\.psmux\\last_session", home);
+            let last_path = format!("{}\\last_session", crate::session::registry_dir());
             let _ = std::fs::write(&last_path, &switch_to);
             // Continue loop to attach to new session
             continue;
@@ -4025,10 +4209,12 @@ fn run_control_mode(mode: u8) -> io::Result<()> {
     use std::net::TcpStream;
 
     // Create diagnostic log FIRST, before anything else, so we can see failures.
+    // The debug log stays on the home path (diagnostics never follow
+    // PSMUX_REGISTRY_DIR); only the .port/.key lookups below use the registry.
+    let psmux_dir = crate::session::registry_dir().to_string();
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let psmux_dir = format!("{}\\.psmux", home);
-    let _ = std::fs::create_dir_all(&psmux_dir);
-    let cc_log_path = format!("{}\\cc_debug.log", psmux_dir);
+    let _ = std::fs::create_dir_all(format!("{}\\.psmux", home));
+    let cc_log_path = format!("{}\\.psmux\\cc_debug.log", home);
     let mut log_file = std::fs::File::create(&cc_log_path).ok();
     macro_rules! cclog {
         ($($arg:tt)*) => {
@@ -4493,6 +4679,89 @@ fn detached_list_windows_ready(resp: &str) -> bool {
     let t = resp.trim();
     !t.is_empty() && !t.starts_with("ERROR:")
 }
+
+/// Environment identifying the calling pane/session for `notify`/`hook-notify`.
+/// Populated from process env vars set by the server into every pane
+/// (see `src/pane.rs`): TMUX_PANE, PSMUX_PANE_INSTANCE, PSMUX_SESSION_UID.
+pub(crate) struct NotifyEnv {
+    pub pane_id: Option<usize>,
+    pub pane_instance: Option<u64>,
+    pub session_uid: String,
+}
+
+impl NotifyEnv {
+    pub(crate) fn from_process_env() -> NotifyEnv {
+        NotifyEnv {
+            pane_id: std::env::var("TMUX_PANE").ok()
+                .and_then(|s| s.trim_start_matches('%').parse::<usize>().ok()),
+            pane_instance: std::env::var("PSMUX_PANE_INSTANCE").ok()
+                .and_then(|s| s.parse::<u64>().ok()),
+            session_uid: std::env::var("PSMUX_SESSION_UID").unwrap_or_default(),
+        }
+    }
+}
+
+/// True when `TMUX_PANE` is set (so we're plainly inside a psmux-managed pane)
+/// but `PSMUX_PANE_INSTANCE` is absent or empty — the signature of a pane that
+/// got its shell by claiming a warm `__warm__` standby, which never had
+/// identity env baked in (see docs/agent-events.md warm caveat). Pure helper
+/// so it's trivially unit-testable without touching real process env.
+pub(crate) fn is_warm_claimed_pane(tmux_pane: Option<&str>, pane_instance: Option<&str>) -> bool {
+    tmux_pane.map(|v| !v.is_empty()).unwrap_or(false)
+        && pane_instance.map(|v| v.is_empty()).unwrap_or(true)
+}
+
+/// `notify`/`hook-notify` are silent no-ops outside psmux by design, but a
+/// warm-claimed initial pane looks identical to "outside psmux" from the
+/// caller's chair (TMUX_PANE is set, so they know they're in a pane) — print
+/// exactly one diagnostic line so this doesn't read as a silent psmux bug.
+/// Never affects the exit code; both call sites still exit 0 after this.
+fn warn_if_warm_claimed_pane() {
+    let tmux_pane = std::env::var("TMUX_PANE").ok();
+    let pane_instance = std::env::var("PSMUX_PANE_INSTANCE").ok();
+    if is_warm_claimed_pane(tmux_pane.as_deref(), pane_instance.as_deref()) {
+        eprintln!("psmux: this pane has no identity (warm-claimed initial pane?) - notify skipped; see docs/agent-events.md warm caveat or set PSMUX_NO_WARM=1");
+    }
+}
+
+/// Build the JSON payload for `notify-event`/hook-notify. Only ever emits the
+/// fields the server's `notify-event` wire arm reads (pane_id, pane_instance,
+/// session_uid, name, title_len, content) — deliberately does NOT include an
+/// "after" key (that belongs to the wait-event request, see AMENDMENT 1: the
+/// server treats a present-but-null `after` as a bad cursor).
+pub(crate) fn build_notify_json(env: &NotifyEnv, name: &str, title_len: usize, content: Option<&str>) -> String {
+    serde_json::json!({
+        "pane_id": env.pane_id,
+        "pane_instance": env.pane_instance,
+        "session_uid": env.session_uid,
+        "name": name,
+        "title_len": title_len,
+        "content": content,
+    }).to_string()
+}
+
+/// Map a `wait-event` wire reply to a CLI exit code.
+pub(crate) fn wait_event_exit_code(reply: &str) -> i32 {
+    let r = reply.trim();
+    if r.starts_with('{') { 0 }
+    else if r == "TIMEOUT" { 2 }
+    else if r == "GAP" { 3 }
+    else if r == "MISMATCH" { 4 }
+    else if r == "ENDED" { 5 }
+    else { 1 }
+}
+
+/// Map an agent hook's (agent, event) pair to a psmux event bus name.
+pub(crate) fn parse_hook_event_name(_agent: &str, event: &str) -> &'static str {
+    match event {
+        "stop" | "agent-turn-complete" => "agent-done",
+        _ => "agent-notify",
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_cli_events_args.rs"]
+mod test_cli_events_args;
 
 #[cfg(test)]
 mod readiness_tests {

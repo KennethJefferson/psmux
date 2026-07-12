@@ -75,9 +75,9 @@ fn should_spawn_warm_server(app: &AppState) -> bool {
     app.warm_enabled && app.session_name != "__warm__" && !app.destroy_unattached
 }
 
-fn ensure_session_registry_files(home: &str, app: &AppState) {
+fn ensure_session_registry_files(app: &AppState) {
     let Some(port) = app.control_port else { return; };
-    let dir = format!("{}\\.psmux", home);
+    let dir = crate::session::registry_dir().to_string();
     let _ = std::fs::create_dir_all(&dir);
 
     let base = app.port_file_base();
@@ -214,18 +214,17 @@ fn spawn_warm_server(app: &AppState) {
         return;
     }
     // Skip if a warm server already exists
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let warm_base = if let Some(ref sn) = app.socket_name {
         format!("{}____warm__", sn)
     } else {
         "__warm__".to_string()
     };
-    let warm_port_path = format!("{}\\.psmux\\{}.port", home, warm_base);
+    let warm_port_path = format!("{}\\{}.port", crate::session::registry_dir(), warm_base);
     warm_debug(&format!("spawn_warm_server entry base={} port_exists={}", warm_base, std::path::Path::new(&warm_port_path).exists()));
     // Serialize the check->spawn window: without this, two callers can both see
     // "no warm" (a freshly-spawned warm hasn't written its port yet) and each
     // spawn one, orphaning all but the last. This is the primary process-leak source.
-    let warm_lock_path = format!("{}\\.psmux\\{}.spawnlock", home, warm_base);
+    let warm_lock_path = format!("{}\\{}.spawnlock", crate::session::registry_dir(), warm_base);
     let spawn_lock = match acquire_warm_spawn_lock(&warm_lock_path) {
         Some(g) => g,
         None => { warm_debug("another warm spawn in progress -- skipping"); return; }
@@ -246,7 +245,7 @@ fn spawn_warm_server(app: &AppState) {
                     Duration::from_millis(100),
                 ).is_ok() {
                     // TCP is up — verify the session name via AUTH.
-                    let warm_key_path = format!("{}\\.psmux\\{}.key", home, warm_base);
+                    let warm_key_path = format!("{}\\{}.key", crate::session::registry_dir(), warm_base);
                     if let Ok(key) = std::fs::read_to_string(&warm_key_path) {
                         let key = key.trim().to_string();
                         if !key.is_empty() {
@@ -282,9 +281,9 @@ fn spawn_warm_server(app: &AppState) {
         // Stale or wrong-server port file — remove it (and matching key/sid files)
         warm_debug("removing STALE warm port/key/sid (unreachable or not a warm server)");
         let _ = std::fs::remove_file(&warm_port_path);
-        let warm_key_path = format!("{}\\.psmux\\{}.key", home, warm_base);
+        let warm_key_path = format!("{}\\{}.key", crate::session::registry_dir(), warm_base);
         let _ = std::fs::remove_file(&warm_key_path);
-        let warm_sid_path = format!("{}\\.psmux\\{}.sid", home, warm_base);
+        let warm_sid_path = format!("{}\\{}.sid", crate::session::registry_dir(), warm_base);
         let _ = std::fs::remove_file(&warm_sid_path);
     }
     warm_debug("SPAWNING new warm server");
@@ -723,6 +722,14 @@ pub(crate) fn read_fresh_config_warnings(since_epoch: u64) -> Vec<String> {
 }
 
 pub fn run_server(session_name: String, socket_name: Option<String>, initial_command: Option<String>, raw_command: Option<Vec<String>>, start_dir: Option<String>, window_name: Option<String>, init_size: Option<(u16, u16)>, group_target: Option<String>, env_vars: Vec<(String, String)>) -> io::Result<()> {
+    if crate::platform::should_refuse_elevated(
+        crate::platform::is_elevated(),
+        std::env::var("PSMUX_ALLOW_ELEVATED").ok(),
+    ) {
+        eprintln!("psmux: refusing to run the server elevated (set PSMUX_ALLOW_ELEVATED=1 to override)");
+        std::process::exit(1);
+    }
+
     // Write crash info to a log file when stderr is unavailable (detached server)
     // and clean up port/key files so stale entries do not linger (issue #204).
     let panic_session_name = session_name.clone();
@@ -738,10 +745,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         } else {
             panic_session_name.clone()
         };
-        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.port", home, base));
-        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.key", home, base));
-        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.sid", home, base));
-        let _ = std::fs::remove_file(format!("{}\\.psmux\\{}.pid", home, base));
+        let _ = std::fs::remove_file(format!("{}\\{}.port", crate::session::registry_dir(), base));
+        let _ = std::fs::remove_file(format!("{}\\{}.key", crate::session::registry_dir(), base));
+        let _ = std::fs::remove_file(format!("{}\\{}.sid", crate::session::registry_dir(), base));
+        let _ = std::fs::remove_file(format!("{}\\{}.pid", crate::session::registry_dir(), base));
     }));
     // Install console control handler to prevent termination on client detach
     install_console_ctrl_handler();
@@ -753,6 +760,14 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     app.session_group = group_target;
     // Server starts detached with a reasonable default window size
     app.attached_clients = 0;
+
+    // Mint a real identity immediately for a normal session. Warm (`__warm__`)
+    // servers stay dormant (empty session_uid) until claimed — see
+    // CtrlReq::ClaimSession below, which mints the identity at that point.
+    if !crate::session::is_warm_session(&app.session_name) {
+        app.session_uid = crate::events::gen_uid();
+        app.bus.activate(app.session_uid.clone());
+    }
 
     // ── P0: single-server-per-name guard (issue #2) ─────────────────────────
     // Hold a named mutex keyed on this session's base name for the server's whole
@@ -791,9 +806,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     // config or creating windows.  run-shell scripts (e.g. PPM) need the
     // port file to discover the server, and the client polls for it to know
     // the server is ready.
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let dir = format!("{}\\.psmux", home);
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = std::fs::create_dir_all(crate::session::registry_dir());
 
     // Generate a random session key for security
     let session_key: String = {
@@ -824,7 +837,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         }
     }
 
-    ensure_session_registry_files(&home, &app);
+    ensure_session_registry_files(&app);
 
     // TEST-ONLY fault injection — compiled out of release builds entirely.
     // Simulates the server dying AFTER writing its .port file but WITHOUT the
@@ -838,8 +851,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         }
     }
 
-    let regpath = format!("{}\\{}.port", dir, app.port_file_base());
-    let keypath = format!("{}\\{}.key", dir, app.port_file_base());
+    let regpath = format!("{}\\{}.port", crate::session::registry_dir(), app.port_file_base());
+    let keypath = format!("{}\\{}.key", crate::session::registry_dir(), app.port_file_base());
 
     // Expose the server identity via env var so that child processes spawned
     // by run-shell (from hooks, keybindings, etc.) can find this server when
@@ -1101,6 +1114,8 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
 
     let mut last_registry_check = Instant::now();
 
+    let mut last_bus_heartbeat = Instant::now();
+
     // Throttle reap_children: only check for exited processes every 250ms.
     // With hundreds of windows, calling try_wait() on every process each
     // loop iteration wastes CPU.  Exited processes are still reaped promptly
@@ -1129,7 +1144,12 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
         }
         if last_registry_check.elapsed() >= Duration::from_secs(5) {
             last_registry_check = Instant::now();
-            ensure_session_registry_files(&home, &app);
+            ensure_session_registry_files(&app);
+        }
+        // events bus heartbeat
+        if last_bus_heartbeat.elapsed() >= std::time::Duration::from_secs(crate::events::HEARTBEAT_SECS) {
+            app.bus.heartbeat();
+            last_bus_heartbeat = std::time::Instant::now();
         }
 
         // Adaptive timeout: ramps from 1ms (active typing/echo) through
@@ -1312,7 +1332,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         | CtrlReq::WindowLayout(..)
                     );
                     let is_temp_focus = matches!(&req,
-                        CtrlReq::FocusWindowTemp(_) | CtrlReq::FocusWindowByIdTemp(_) | CtrlReq::FocusWindowByNameTemp(_) | CtrlReq::FocusPaneTemp(_) | CtrlReq::FocusPaneByIndexTemp(_));
+                        CtrlReq::FocusWindowTemp(_) | CtrlReq::FocusWindowByIdTemp(_) | CtrlReq::FocusWindowByNameTemp(_) | CtrlReq::FocusPaneTemp(_) | CtrlReq::FocusPaneByIndexTemp(_)
+                        // capture-pane --settle's poll loop: must never consume the
+                        // temp-focus restore, or a probe landing between FocusPaneTemp
+                        // and the final CapturePane would snap focus back to the
+                        // original active pane before the capture fires (see
+                        // PaneDataVersion doc comment in types.rs).
+                        | CtrlReq::PaneDataVersion(..));
                     let mut hook_event: Option<&str> = None;
                     // Track active_idx changes for debugging window-switch issues
                     let _prev_active_idx = app.active_idx;
@@ -1814,19 +1840,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         hook_event = Some("client-detached");
                         if app.attached_clients == 0 && app.destroy_unattached {
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                            let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                            let _ = std::fs::remove_file(&regpath);
-                            let _ = std::fs::remove_file(&keypath);
-                            crate::session::remove_session_id_file(&app.port_file_base());
                             crate::types::shutdown_persistent_streams();
                             tree::kill_all_children_batch(&mut app.windows);
                             if let Some(mut wp) = app.warm_pane.take() {
                                 wp.child.kill().ok();
                             }
                             std::thread::sleep(std::time::Duration::from_millis(10));
-                            std::process::exit(0);
+                            shutdown_server(&mut app, "detach-exit");
                         }
                     }
                 }
@@ -2923,14 +2943,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 CtrlReq::KillSession => {
                     // Fire session-closed hook before cleanup
                     if let Some(cmds) = app.hooks.get("session-closed") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    // Remove port/key/sid files FIRST so clients see the session
-                    // as gone immediately, then kill processes.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                    let _ = std::fs::remove_file(&regpath);
-                    let _ = std::fs::remove_file(&keypath);
-                    crate::session::remove_session_id_file(&app.port_file_base());
+                    // Explicit kill-session of the namespace's LAST real session
+                    // also retires the namespace's warm standby, so "kill-session"
+                    // leaves nothing of the user's running. The scan is
+                    // conservative (an unverifiable session counts as present)
+                    // and a warm claimed between scan and retire refuses — this
+                    // can never take down a real session. Natural teardown
+                    // (exit-empty, destroy-unattached) deliberately keeps the
+                    // warm server for the next new-session.
+                    if !app.is_warm_server()
+                        && !crate::session::namespace_has_other_live_session(
+                            app.socket_name.as_deref(), &app.port_file_base())
+                    {
+                        crate::session::retire_warm_server(app.socket_name.as_deref());
+                    }
                     crate::types::send_directive_to_all_clients("DETACH");
                     std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
@@ -2941,24 +2967,74 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // TerminateProcess is synchronous on Windows — processes
                     // are already dead.  Minimal delay for OS handle cleanup.
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    std::process::exit(0);
+                    shutdown_server(&mut app, "session-teardown");
                 }
                 CtrlReq::HasSession(resp) => {
                     let _ = resp.send(true);
                 }
+                CtrlReq::RetireWarm(resp) => {
+                    // Only a still-dormant standby may retire. Once claimed,
+                    // this server IS (or is becoming) a real session — refuse,
+                    // exactly like ClaimSession refuses a second claim.
+                    if app.is_warm_server() {
+                        warm_debug(&format!("RETIRE ACCEPT: __warm__ (port={:?})", app.control_port));
+                        // Retirement is closed in three steps, none of them
+                        // timing-based:
+                        // 1. Set WARM_RETIRING under WARM_CLAIM_GATE — claim
+                        //    threads check-and-enqueue under the same gate, so
+                        //    once the gate is released here, every thread that
+                        //    saw "not retiring" has already enqueued and every
+                        //    later one refuses synchronously with the explicit
+                        //    ERR (a committed claimant's ONLY cold-spawn
+                        //    trigger; it treats silence as success).
+                        // 2. Remove our own registry entry now, so no new
+                        //    claimant can even find this server. The 5s
+                        //    self-heal runs on THIS thread and never past this
+                        //    handler, so nothing resurrects the pointer.
+                        // 3. One drain-to-empty of the queue refuses whatever
+                        //    was enqueued before step 1 — complete by the gate
+                        //    argument above, no grace sleep required.
+                        {
+                            let _g = crate::types::WARM_CLAIM_GATE.lock().unwrap_or_else(|e| e.into_inner());
+                            crate::types::WARM_RETIRING.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        let base = app.port_file_base();
+                        let _ = std::fs::remove_file(format!("{}\\{}.port", crate::session::registry_dir(), base));
+                        let _ = std::fs::remove_file(format!("{}\\{}.key", crate::session::registry_dir(), base));
+                        let _ = resp.send("OK\n".to_string());
+                        if let Some(rx) = app.control_rx.as_ref() {
+                            while let Ok(req) = rx.try_recv() {
+                                match req {
+                                    CtrlReq::ClaimSession(name, _, cresp) => {
+                                        warm_debug(&format!("CLAIM REFUSED while retiring: requested name='{}'", name));
+                                        let _ = cresp.send("ERR: not a warm server (retiring)\n".to_string());
+                                    }
+                                    CtrlReq::RetireWarm(r2) => { let _ = r2.send("OK\n".to_string()); }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        tree::kill_all_children_batch(&mut app.windows);
+                        if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                        shutdown_server(&mut app, "warm-retired");
+                    } else {
+                        warm_debug(&format!("RETIRE REFUSED: this server is '{}' (port={:?})", app.session_name, app.control_port));
+                        let _ = resp.send("ERR: not warm\n".to_string());
+                    }
+                }
                 CtrlReq::RenameSession(name) => {
                     if let Some(cmds) = app.hooks.get("before-rename-session") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let old_path = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let old_keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                    let old_path = format!("{}\\{}.port", crate::session::registry_dir(), app.port_file_base());
+                    let old_keypath = format!("{}\\{}.key", crate::session::registry_dir(), app.port_file_base());
                     // Compute new port file base with socket_name prefix
                     let new_base = if let Some(ref sn) = app.socket_name {
                         format!("{}__{}" , sn, name)
                     } else {
                         name.clone()
                     };
-                    let new_path = format!("{}\\.psmux\\{}.port", home, new_base);
-                    let new_keypath = format!("{}\\.psmux\\{}.key", home, new_base);
+                    let new_path = format!("{}\\{}.port", crate::session::registry_dir(), new_base);
+                    let new_keypath = format!("{}\\{}.key", crate::session::registry_dir(), new_base);
                     if let Some(port) = app.control_port {
                         let _ = std::fs::remove_file(&old_path);
                         let _ = std::fs::write(&new_path, port.to_string());
@@ -2999,16 +3075,15 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     warm_debug(&format!("CLAIM ACCEPT: __warm__ (port={:?}) -> '{}'", app.control_port, name));
                     // Same as RenameSession but with a synchronous response
                     // so the CLI knows the rename completed before attaching.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let old_path = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let old_keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
+                    let old_path = format!("{}\\{}.port", crate::session::registry_dir(), app.port_file_base());
+                    let old_keypath = format!("{}\\{}.key", crate::session::registry_dir(), app.port_file_base());
                     let new_base = if let Some(ref sn) = app.socket_name {
                         format!("{}__{}" , sn, name)
                     } else {
                         name.clone()
                     };
-                    let new_path = format!("{}\\.psmux\\{}.port", home, new_base);
-                    let new_keypath = format!("{}\\.psmux\\{}.key", home, new_base);
+                    let new_path = format!("{}\\{}.port", crate::session::registry_dir(), new_base);
+                    let new_keypath = format!("{}\\{}.key", crate::session::registry_dir(), new_base);
                     if let Some(port) = app.control_port {
                         let _ = std::fs::remove_file(&old_path);
                         let _ = std::fs::write(&new_path, port.to_string());
@@ -3028,6 +3103,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         crate::session::write_session_pid_file(&new_base, std::process::id());
                     }
                     app.session_name = name;
+                    // Server was dormant (empty session_uid) while __warm__; minting
+                    // here activates identity now that it is a real, claimed session.
+                    app.session_uid = crate::events::gen_uid();
+                    app.bus.activate(app.session_uid.clone());
                     // Warm server's created_at is the warm process start time, not the
                     // user's session-creation time — reset on claim or list-sessions /
                     // session_created / uptime would report the warm pool's age.
@@ -4138,19 +4217,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     });
                     hook_event = Some("client-detached");
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
                             wp.child.kill().ok();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        shutdown_server(&mut app, "detach-exit");
                     }
                 }
                 CtrlReq::ForceDetachClientByTty(tty, kill_parent) => {
@@ -4225,19 +4298,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         hook_event = Some("client-detached");
                     }
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
                             wp.child.kill().ok();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        shutdown_server(&mut app, "detach-exit");
                     }
                 }
                 CtrlReq::DetachAllClients(kill_parent) => {
@@ -4276,19 +4343,13 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         hook_event = Some("client-detached");
                     }
                     if app.attached_clients == 0 && app.destroy_unattached {
-                        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                        let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                        let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                        let _ = std::fs::remove_file(&regpath);
-                        let _ = std::fs::remove_file(&keypath);
-                        crate::session::remove_session_id_file(&app.port_file_base());
                         crate::types::shutdown_persistent_streams();
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() {
                             wp.child.kill().ok();
                         }
                         std::thread::sleep(std::time::Duration::from_millis(10));
-                        std::process::exit(0);
+                        shutdown_server(&mut app, "detach-exit");
                     }
                 }
                 CtrlReq::SwitchClient(target, flag) => {
@@ -4327,8 +4388,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         }
                         'l' => {
                             // Last session (read from last_session file)
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            let last_path = format!("{}\\.psmux\\last_session", home);
+                            let last_path = format!("{}\\last_session", crate::session::registry_dir());
                             std::fs::read_to_string(&last_path).ok()
                                 .map(|s| s.trim().to_string())
                                 .filter(|s| !s.is_empty() && s != &current && all_sessions.contains(s))
@@ -4475,6 +4535,22 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.hooks.remove(&hook);
                 }
                 CtrlReq::KillServer => {
+                    // Tell event-bus subscribers the bus is closing as early as
+                    // possible so `psmux events` can exit 0 (clean close) instead
+                    // of treating the imminent socket drop as transport loss, and
+                    // so it has the maximum head start over the CLI's own
+                    // kill-server nuclear fallback (kill_remaining_server_processes
+                    // in main.rs, which terminates any surviving psmux.exe by image
+                    // name ~50ms after this server's control connection closes —
+                    // that fallback races independently of anything server-side,
+                    // so the subscriber's write must not be delayed behind the
+                    // rest of this handler's cleanup). Their connection threads
+                    // wake from recv_timeout, write the {"type":"closed"} frame,
+                    // and flush immediately; shutdown_server's close_all below is
+                    // a harmless no-op repeat (drain-based) that also covers any
+                    // subscriber that arrived after this point.
+                    let _ = app.bus.publish("bus-closed", "bus", None, None, serde_json::json!({ "reason": "kill-server" }));
+                    app.bus.close_all("kill-server");
                     // Notify control clients that the server is going away,
                     // matching tmux's "%exit" wire notification before close.
                     // Flushes through the writer thread so iTerm2 sees a
@@ -4490,13 +4566,6 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         // %exit + ST before the process exits.
                         std::thread::sleep(std::time::Duration::from_millis(80));
                     }
-                    // Remove port/key files FIRST so clients see the session
-                    // as gone immediately, then kill processes.
-                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                    let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                    let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                    let _ = std::fs::remove_file(&regpath);
-                    let _ = std::fs::remove_file(&keypath);
                     crate::types::send_directive_to_all_clients("DETACH");
                     std::thread::sleep(Duration::from_millis(50));
                     crate::types::shutdown_persistent_streams();
@@ -4507,7 +4576,10 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // TerminateProcess is synchronous on Windows — processes
                     // are already dead.  Minimal delay for OS handle cleanup.
                     std::thread::sleep(std::time::Duration::from_millis(10));
-                    std::process::exit(0);
+                    // shutdown_server publishes bus-closed + close_all("kill-server")
+                    // (idempotent even though close_all is drain-based) and removes
+                    // the registry files before exiting.
+                    shutdown_server(&mut app, "kill-server");
                 }
                 CtrlReq::WaitFor(channel, op) => {
                     match op {
@@ -4540,6 +4612,54 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                             });
                         }
                     }
+                }
+                CtrlReq::EventsSubscribe { names, categories, after, tx: sub_tx, ack } => {
+                    let a = app.bus.subscribe(names, categories, after, sub_tx);
+                    let _ = ack.send(a.ack_json);
+                }
+                CtrlReq::EventsCursor(resp) => {
+                    let out = if app.bus.is_active() {
+                        format!("{}:{}:{}", app.session_uid, app.bus.bus_id(), app.bus.latest_seq())
+                    } else {
+                        "ERR: bus dormant".to_string()
+                    };
+                    let _ = resp.send(out);
+                }
+                CtrlReq::NotifyEvent { pane_id, pane_instance, session_uid, name, title_len, content, resp } => {
+                    let live = live_pane_instance(&app, pane_id.unwrap_or(0));
+                    let valid = validate_notify(&app, pane_id, pane_instance, &session_uid, |_pid| live);
+                    let seq = handle_notify_validated(&mut app, valid, pane_id, pane_instance, &name, title_len, content);
+                    let _ = resp.send(match (valid, seq) {
+                        (true, Some(s)) => format!("OK {}", s),
+                        (false, _) => "STALE".to_string(),
+                        _ => "ERR: bus dormant".to_string(),
+                    });
+                }
+                CtrlReq::PaneDataVersion(pane_id, resp) => {
+                    let out = match pane_id {
+                        Some(pid) => {
+                            let mut found: Option<u64> = None;
+                            for w in &app.windows {
+                                let mut v = None;
+                                tree::for_each_pane(&w.root, &mut |p: &crate::types::Pane| {
+                                    if p.id == pid { v = Some(p.data_version.load(std::sync::atomic::Ordering::Relaxed)); }
+                                });
+                                if v.is_some() { found = v; break; }
+                            }
+                            match found {
+                                Some(v) => format!("{}", v),
+                                None => "NOPANE".to_string(),
+                            }
+                        }
+                        None => {
+                            let v = app.windows.get(app.active_idx)
+                                .and_then(|w| active_pane(&w.root, &w.active_path))
+                                .map(|p| p.data_version.load(std::sync::atomic::Ordering::Relaxed))
+                                .unwrap_or(0);
+                            format!("{}", v)
+                        }
+                    };
+                    let _ = resp.send(out);
                 }
                 CtrlReq::DisplayMenu(menu_def, x, y) => {
                     let menu = parse_menu_definition(&menu_def, x, y);
@@ -4775,8 +4895,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                         app.windows.len(),
                         (chrono::Local::now() - app.created_at).num_seconds(),
                         {
-                            let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                            format!("{}\\.psmux\\{}.port", home, app.port_file_base())
+                            format!("{}\\{}.port", crate::session::registry_dir(), app.port_file_base())
                         }
                     );
                     let _ = resp.send(info);
@@ -5213,6 +5332,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 for cmd in cmds {
                     let _ = execute_command_string(&mut app, &cmd);
                 }
+                publish_hook_event(&mut app, event);
                 // Emit control mode notifications for hook events
                 if !app.control_clients.is_empty() {
                     let active_win = &app.windows[app.active_idx];
@@ -5713,7 +5833,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 Some(app.windows[app.active_idx].id)
             } else { None };
 
-            let (all_empty, any_pruned, any_newly_dead) = tree::reap_children(&mut app)?;
+            let (all_empty, any_pruned, any_newly_dead, pane_transitions) = tree::reap_children(&mut app)?;
             if any_pruned {
                 // A pane was removed from the tree - resize remaining panes to fill the space
                 resize_all_panes(&mut app);
@@ -5768,6 +5888,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 meta_dirty = true;
                 crate::commands::fire_hooks(&mut app, "pane-died");
                 crate::commands::fire_hooks(&mut app, "pane-exited");
+                publish_pane_transitions(&mut app, &pane_transitions);
             }
             if app.exit_empty && all_empty {
                 warm_debug(&format!("EXIT_EMPTY firing for session '{}' (all panes empty/dead) -> removing port file + process::exit", app.session_name));
@@ -5782,24 +5903,113 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     // the DCS stream before we tear down the process.
                     std::thread::sleep(std::time::Duration::from_millis(80));
                 }
-                let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                let regpath = format!("{}\\.psmux\\{}.port", home, app.port_file_base());
-                let keypath = format!("{}\\.psmux\\{}.key", home, app.port_file_base());
-                let _ = std::fs::remove_file(&regpath);
-                let _ = std::fs::remove_file(&keypath);
                 crate::types::send_directive_to_all_clients("DETACH");
                 std::thread::sleep(Duration::from_millis(50));
                 crate::types::shutdown_persistent_streams();
                 // Kill warm pane's child (process::exit skips Drop)
                 if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
                 std::thread::sleep(std::time::Duration::from_millis(10));
-                std::process::exit(0);
+                shutdown_server(&mut app, "exit-empty");
             }
         }
         // recv_timeout already handles the wait; no additional sleep needed.
     }
     #[allow(unreachable_code)]
     Ok(())
+}
+
+/// Single orderly-exit path: publish the terminal `bus-closed` event, close
+/// out subscribers (so `psmux events` sees a clean `{"type":"closed"}` frame
+/// instead of transport loss), then perform the registry-file cleanup every
+/// call site used to do inline before `process::exit`. Callers still run
+/// their own site-specific pre-cleanup (client DETACH directives, control
+/// `%exit` notifications, killing child processes, warm-pane teardown) —
+/// this is only the shared tail.
+///
+/// The 80ms sleep after `close_all` gives subscriber writer threads a beat
+/// to flush the closed frame before the process disappears; do not remove
+/// it or convert `close_all`'s `try_send` into a blocking send (slow
+/// consumers are intentionally dropped, not allowed to stall shutdown).
+pub(crate) fn shutdown_server(app: &mut AppState, reason: &'static str) -> ! {
+    let _ = app.bus.publish("bus-closed", "bus", None, None, serde_json::json!({ "reason": reason }));
+    app.bus.close_all(reason);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    let regpath = format!("{}\\{}.port", crate::session::registry_dir(), app.port_file_base());
+    let keypath = format!("{}\\{}.key", crate::session::registry_dir(), app.port_file_base());
+    let _ = std::fs::remove_file(&regpath);
+    let _ = std::fs::remove_file(&keypath);
+    crate::session::remove_session_id_file(&app.port_file_base());
+    std::process::exit(0);
+}
+
+/// Map a committed hook_event tag to a bus event. Called from the hook_event
+/// consumer at the single post-command chokepoint.
+pub(crate) fn publish_hook_event(app: &mut AppState, event: &str) {
+    let (name, category, payload) = match event {
+        "after-new-window" => ("window-created", "window",
+            serde_json::json!({ "window_id": app.windows.get(app.active_idx).map(|w| w.id) })),
+        "after-rename-session" => ("session-renamed", "session",
+            serde_json::json!({ "name_len": app.session_name.len() })),
+        _ => return,
+    };
+    let _ = app.bus.publish(name, category, None, None, payload);
+}
+
+/// Publish a `pane-exited` event for each pane that left the live tree during
+/// the most recent reap pass, carrying its identity (pane id + instance) so
+/// subscribers can distinguish this pane from any future pane reusing the id.
+pub(crate) fn publish_pane_transitions(app: &mut AppState, transitions: &[crate::tree::PaneTransition]) {
+    for t in transitions {
+        let _ = app.bus.publish(
+            "pane-exited", "pane", Some(t.pane_id), Some(t.instance),
+            serde_json::json!({ "window_id": t.window_id, "reason": "exited" }),
+        );
+    }
+}
+
+/// Look up a live pane's instance by pane id across all windows (None = not found).
+pub(crate) fn live_pane_instance(app: &AppState, pane_id: usize) -> Option<u64> {
+    for w in &app.windows {
+        let mut found = None;
+        tree::for_each_pane(&w.root, &mut |p: &crate::types::Pane| {
+            if p.id == pane_id && !p.dead { found = Some(p.instance); }
+        });
+        if found.is_some() { return found; }
+    }
+    None
+}
+
+/// Pure validation used by NotifyEvent (lookup injected for testability).
+pub(crate) fn validate_notify(
+    app: &AppState,
+    pane_id: Option<usize>,
+    pane_instance: Option<u64>,
+    caller_session_uid: &str,
+    lookup: impl Fn(usize) -> Option<u64>,
+) -> bool {
+    if caller_session_uid.is_empty() || caller_session_uid != app.session_uid { return false; }
+    let (Some(pid), Some(pinst)) = (pane_id, pane_instance) else { return false; };
+    lookup(pid) == Some(pinst)
+}
+
+pub(crate) fn handle_notify_validated(
+    app: &mut AppState,
+    valid: bool,
+    pane_id: Option<usize>,
+    pane_instance: Option<u64>,
+    name: &str,
+    title_len: usize,
+    content: Option<String>,
+) -> Option<u64> {
+    let mut payload = serde_json::json!({ "title_len": title_len });
+    if let (true, Some(c)) = (app.event_content, content) {
+        payload["content"] = serde_json::Value::String(c);
+    }
+    if valid {
+        app.bus.publish(name, "agent", pane_id, pane_instance, payload)
+    } else {
+        app.bus.publish("stale-notify", "agent", pane_id, pane_instance, payload)
+    }
 }
 
 #[cfg(test)]
@@ -5829,3 +6039,11 @@ mod test_issue167_startup_log;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue370_startup_error_passthrough.rs"]
 mod test_issue370_startup_error_passthrough;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_agent_events_wiring.rs"]
+mod test_agent_events_wiring;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_agent_events_handlers.rs"]
+mod test_agent_events_handlers;

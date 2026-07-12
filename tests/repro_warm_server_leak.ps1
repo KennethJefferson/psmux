@@ -48,6 +48,17 @@ $afterChurn = Count-Psmux
 $afterChurnWarm = Count-Warm
 I "after $N create/kill cycles: psmux=$afterChurn warm=$afterChurnWarm"
 
+# D2 (retire-warm): each cycle's kill-session killed the namespace's LAST real
+# session, which must also retire the namespace warm standby. After the final
+# kill-session, zero warm servers may remain in this namespace.
+$nsWarm = @(Get-CimInstance Win32_Process -Filter "Name='psmux.exe'" -EA SilentlyContinue |
+  Where-Object { $_.CommandLine -match '-s __warm__' -and $_.CommandLine -match "-L $NS" }).Count
+if ($nsWarm -eq 0) {
+  P "kill-session of last real session retired the namespace warm server (0 remain)"
+} else {
+  F "WARM NOT RETIRED: $nsWarm namespace warm server(s) alive after last kill-session"
+}
+
 # Tear down the namespace server.
 & psmux -L $NS kill-server 2>&1 | Out-Null
 Start-Sleep -Seconds 2

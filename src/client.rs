@@ -1366,13 +1366,12 @@ fn try_reconnect(addr: &str, key: &str) -> Option<Connection> {
 
 pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::PsmuxWriter>>, input: &crate::ssh_input::InputSource) -> io::Result<()> {
     let name = env::var("PSMUX_SESSION_NAME").unwrap_or_else(|_| "default".to_string());
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let path = format!("{}\\.psmux\\{}.port", home, name);
+    let path = format!("{}\\{}.port", crate::session::registry_dir(), name);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("can't find session '{}' (no server running)", name)))?;
     let addr = format!("127.0.0.1:{}", port);
     let session_key = read_session_key(&name).unwrap_or_default();
-    let last_path = format!("{}\\.psmux\\last_session", home);
+    let last_path = format!("{}\\last_session", crate::session::registry_dir());
     if !crate::session::is_warm_session(&name) {
         let _ = std::fs::write(&last_path, &name);
     }
@@ -2856,7 +2855,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 popup_rect_last = None;
                                 if choose_tree_preview_default { preview_enabled = true; }
                                 // Query ALL sessions (like tmux choose-tree)
-                                let dir = format!("{}\\.psmux", home);
+                                let dir = crate::session::registry_dir().to_string();
                                 if let Ok(entries) = std::fs::read_dir(&dir) {
                                     let mut sessions: Vec<(String, Vec<(usize, String, bool, Vec<(usize, String)>, usize)>)> = Vec::new();
                                     for e in entries.flatten() {
@@ -2954,7 +2953,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 popup_dragging = false;
                                 popup_rect_last = None;
                                 if choose_tree_preview_default { preview_enabled = true; }
-                                let dir = format!("{}\\.psmux", home);
+                                let dir = crate::session::registry_dir().to_string();
                                 // Collect (label, addr, key) for every port file, then run ONE
                                 // bounded liveness probe per session in parallel. This both lists
                                 // and prunes: total wall time is ~one probe window regardless of
@@ -3022,7 +3021,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 buffer_scroll = 0;
                                 buffer_num_buffer.clear();
                                 // Fetch buffer list from server via TCP
-                                let port_file = format!("{}\\.psmux\\{}.port", home, current_session);
+                                let port_file = format!("{}\\{}.port", crate::session::registry_dir(), current_session);
                                 if let Ok(port_str) = std::fs::read_to_string(&port_file) {
                                     if let Ok(p) = port_str.trim().parse::<u16>() {
                                         let sess_key = read_session_key(&current_session).unwrap_or_default();
@@ -3068,7 +3067,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                 }
                             }
                             if let Some(dir_next) = do_session_nav {
-                                let dir = format!("{}\\.psmux", home);
+                                let dir = crate::session::registry_dir().to_string();
                                 let mut names: Vec<String> = Vec::new();
                                 if let Ok(entries) = std::fs::read_dir(&dir) {
                                     for e in entries.flatten() {
@@ -3191,9 +3190,8 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             quit = true;
                                         } else {
                                             // Kill another session by connecting to it
-                                            let h = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-                                            let port_path = format!("{}\\.psmux\\{}.port", h, sname);
-                                            let key_path = format!("{}\\.psmux\\{}.key", h, sname);
+                                            let port_path = format!("{}\\{}.port", crate::session::registry_dir(), sname);
+                                            let key_path = format!("{}\\{}.key", crate::session::registry_dir(), sname);
                                             if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                                                 if let Ok(port) = port_str.trim().parse::<u16>() {
                                                     let addr = format!("127.0.0.1:{}", port);
@@ -3488,7 +3486,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                             buffer_selected = 0;
                                             buffer_scroll = 0;
                                             buffer_num_buffer.clear();
-                                            let port_file = format!("{}\\.psmux\\{}.port", home, current_session);
+                                            let port_file = format!("{}\\{}.port", crate::session::registry_dir(), current_session);
                                             if let Ok(port_str) = std::fs::read_to_string(&port_file) {
                                                 if let Ok(p) = port_str.trim().parse::<u16>() {
                                                     let sess_key = read_session_key(&current_session).unwrap_or_default();
@@ -5108,7 +5106,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             } else { None }
                         } else { None };
                         let win_id = win_id.or_else(|| {
-                            let port_path = format!("{}\\.psmux\\{}.port", home, sname);
+                            let port_path = format!("{}\\{}.port", crate::session::registry_dir(), sname);
                             let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
                             let key = crate::session::read_session_key(sname).ok()?;
                             let resp = crate::session::fetch_authed_response_multi(
@@ -5126,7 +5124,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
                         if let Some(wid) = win_id {
                             if let Some(layout) = crate::preview::get_or_fetch_dump(
-                                &mut dump_cache, &home, sname, wid,
+                                &mut dump_cache, sname, wid,
                             ) {
                                 crate::preview::render_dump_tree(
                                     f,
@@ -5153,7 +5151,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                                     } else { None }
                                 } else { None };
                                 let wid = win_id?;
-                                crate::preview::get_or_fetch(&mut preview_cache, &home, sname, wid, usize::MAX)
+                                crate::preview::get_or_fetch(&mut preview_cache, sname, wid, usize::MAX)
                             });
                         let pv: Vec<Line> = match preview_text {
                             Some(t) => crate::preview::parse_ansi_lines(&t, parea.width, parea.height),
@@ -5311,7 +5309,7 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
 
                         if let Some(twid) = target_win {
                             if let Some(layout) = crate::preview::get_or_fetch_dump(
-                                &mut dump_cache, &home, &sess, twid,
+                                &mut dump_cache, &sess, twid,
                             ) {
                                 // Highlight which pane the user is hovering on
                                 // (for pane-level entries). Active pane gets a
@@ -5335,11 +5333,11 @@ pub fn run_remote(terminal: &mut Terminal<CrosstermBackend<crate::platform::Psmu
                             let preview_text: Option<String> = if is_win && wid == usize::MAX {
                                 tree_entries.iter()
                                     .find(|(iw, w, _p, _l, s)| *iw && *w != usize::MAX && s == &sess)
-                                    .and_then(|(_, w, _p, _l, s)| crate::preview::get_or_fetch(&mut preview_cache, &home, s, *w, usize::MAX))
+                                    .and_then(|(_, w, _p, _l, s)| crate::preview::get_or_fetch(&mut preview_cache, s, *w, usize::MAX))
                             } else if is_win {
-                                crate::preview::get_or_fetch(&mut preview_cache, &home, &sess, wid, usize::MAX)
+                                crate::preview::get_or_fetch(&mut preview_cache, &sess, wid, usize::MAX)
                             } else {
-                                crate::preview::get_or_fetch(&mut preview_cache, &home, &sess, wid, pid)
+                                crate::preview::get_or_fetch(&mut preview_cache, &sess, wid, pid)
                             };
                             let pv: Vec<Line> = match preview_text {
                                 Some(t) => crate::preview::parse_ansi_lines(&t, parea.width, parea.height),

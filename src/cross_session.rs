@@ -20,10 +20,7 @@ use std::time::Duration;
 
 /// Resolve a session name to (port, key).
 pub fn resolve_session(session_name: &str) -> io::Result<(u16, String)> {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_default();
-    let port_path = format!("{}\\.psmux\\{}.port", home, session_name);
+    let port_path = format!("{}\\{}.port", crate::session::registry_dir(), session_name);
     let port: u16 = std::fs::read_to_string(&port_path)
         .map_err(|_| io::Error::new(io::ErrorKind::NotFound,
             format!("no server for session '{}'", session_name)))?

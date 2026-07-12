@@ -1656,6 +1656,13 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     // Expand format variables like #{pane_current_path} at spawn time (#111).
     // Must happen before the mutable borrow of app.windows below.
     let expanded_shell = crate::format::expand_format(&app.default_shell, &app);
+    // Respawn keeps the same pane id but must never reuse an old instance —
+    // downstream event consumers use (pane_id, instance) to detect a respawn.
+    // Allocated (and identity strings snapshotted) before the mutable borrow
+    // of app.windows below.
+    let new_instance = app.alloc_pane_instance();
+    let session_uid = app.session_uid.clone();
+    let bus_id = app.bus_id_string();
 
     let win = &mut app.windows[app.active_idx];
     let Some(pane) = active_pane_mut(&mut win.root, &win.active_path) else { return Ok(()); };
@@ -1673,8 +1680,8 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     } else {
         detect_shell()
     };
-    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
+    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, new_instance, &session_uid, &bus_id, app.claude_code_fix_tty, app.claude_code_force_interactive);
     if let Some(dir) = workdir {
         let home = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
@@ -1711,6 +1718,7 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.writer = pty_writer;
     pane.child = child;
     pane.term = term;
+    pane.instance = new_instance;
     pane.data_version = data_version;
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;
@@ -1739,6 +1747,13 @@ pub fn heal_respawn_pane(
 ) -> io::Result<()> {
     // Expand format vars (e.g. #{pane_current_path}) before the mutable borrow.
     let expanded_shell = crate::format::expand_format(&app.default_shell, &app);
+    // A healed pane keeps its pane id but gets a FRESH shell process, so it
+    // must never reuse the crashed shell's instance — downstream event
+    // consumers use (pane_id, instance) to detect the swap. Same contract as
+    // respawn_active_pane above; snapshotted before the mutable borrow.
+    let new_instance = app.alloc_pane_instance();
+    let session_uid = app.session_uid.clone();
+    let bus_id = app.bus_id_string();
 
     let Some(win) = app.windows.get_mut(win_idx) else { return Ok(()); };
     let Some(pane) = active_pane_mut(&mut win.root, path) else { return Ok(()); };
@@ -1751,7 +1766,7 @@ pub fn heal_respawn_pane(
     } else {
         detect_shell()
     };
-    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
+    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, new_instance, &session_uid, &bus_id, app.claude_code_fix_tty, app.claude_code_force_interactive);
     crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     drop(pair.slave);
@@ -1781,6 +1796,7 @@ pub fn heal_respawn_pane(
     pane.writer = pty_writer;
     pane.child = child;
     pane.term = term;
+    pane.instance = new_instance;
     pane.data_version = data_version;
     pane.cursor_shape = cursor_shape;
     pane.bell_pending = bell_pending;

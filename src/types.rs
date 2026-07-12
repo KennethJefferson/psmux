@@ -89,6 +89,10 @@ pub struct Pane {
     pub last_rows: u16,
     pub last_cols: u16,
     pub id: usize,
+    /// Per-pane identity, unique within this server's lifetime; never reused.
+    /// Popups stay `0` (excluded by design). Warm-transplanted panes get a
+    /// fresh instance but no identity env (spawned pre-claim).
+    pub instance: u64,
     pub title: String,
     /// When true, `infer_title_from_prompt` will not overwrite the title.
     /// Set by `select-pane -T` (explicit title). Cleared by `select-pane -T ""`.
@@ -189,6 +193,16 @@ pub struct WarmPane {
     pub rows: u16,
     pub cols: u16,
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
+    /// The pane_instance actually baked into this pane's live env at spawn
+    /// time (Some(n) whenever the owning server already had a minted
+    /// session_uid — i.e. a live session replenishing its own pool), or
+    /// None for a genuine pre-claim `__warm__` server spawn (no identity
+    /// env was set at all; see `set_tmux_env`). Transplant call sites MUST
+    /// reuse this value instead of calling `alloc_pane_instance()` again —
+    /// the child process's env can never be corrected post-spawn, so a
+    /// second allocation would desync the tree's `Pane.instance` from the
+    /// value the pane's own environment actually reports.
+    pub minted_instance: Option<u64>,
 }
 
 /// A pane extracted from this session for cross-session forwarding.
@@ -516,6 +530,14 @@ pub struct AppState {
     /// Sender cloned into each run-shell background thread.
     pub run_shell_tx: Option<mpsc::Sender<(String, String)>>,
     pub session_name: String,
+    /// Unique per-server-lifetime identity, empty while dormant (`__warm__` before claim).
+    pub session_uid: String,
+    /// Monotonic counter for `Pane.instance` allocation; never reused within a server lifetime.
+    pub next_pane_instance: u64,
+    /// Server option: allow event content payloads (Task 5+).
+    pub event_content: bool,
+    /// In-memory event bus (dormant until session identity is minted).
+    pub bus: crate::events::EventBus,
     /// Numeric session ID (tmux-compatible: $0, $1, $2...).
     pub session_id: usize,
     /// -L socket name for namespace isolation (tmux compatible).
@@ -772,6 +794,17 @@ impl AppState {
         self.session_name == "__warm__"
     }
 
+    /// Allocates a fresh, never-reused pane instance id for this server's lifetime.
+    pub fn alloc_pane_instance(&mut self) -> u64 {
+        let i = self.next_pane_instance;
+        self.next_pane_instance += 1;
+        i
+    }
+
+    pub fn bus_id_string(&self) -> String {
+        self.bus.bus_id().to_string()
+    }
+
     /// Whether this server should run the periodic `status-interval` timer,
     /// which fires user `status-interval` hooks and re-renders the status line
     /// so time formats (`%H:%M:%S`, `%r`, ...) stay current.
@@ -1021,6 +1054,10 @@ impl AppState {
             run_shell_rx: None,
             run_shell_tx: None,
             session_name,
+            session_uid: String::new(),
+            next_pane_instance: 1,
+            event_content: false,
+            bus: crate::events::EventBus::new_dormant(),
             session_id: crate::session::allocate_session_id(),
             socket_name: None,
             attached_clients: 0,
@@ -1335,6 +1372,11 @@ pub enum CtrlReq {
     /// Claim a warm server: rename session + send response so CLI knows it's done.
     /// Fields: session name, optional client CWD, response sender.
     ClaimSession(String, Option<String>, mpsc::Sender<String>),
+    /// Retire a dormant warm standby (sent by kill-session when it tears down
+    /// the namespace's last real session). Replies `OK` and shuts down only
+    /// while still genuinely warm; a server that has been claimed replies
+    /// `ERR: not warm` and stays up — retirement can never kill a real session.
+    RetireWarm(mpsc::Sender<String>),
     SwapPane(String),
     /// swap-pane -t <target>: swap the active pane with the pane identified by
     /// (target, pane_is_id).  When `pane_is_id` is true the value is a pane id
@@ -1504,6 +1546,31 @@ pub enum CtrlReq {
     RemoveHook(String),
     KillServer,
     WaitFor(String, WaitForOp),
+    EventsSubscribe {
+        names: Vec<String>,
+        categories: Vec<String>,
+        after: Option<crate::events::Cursor>,
+        tx: std::sync::mpsc::SyncSender<crate::events::SubscriberMsg>,
+        ack: std::sync::mpsc::Sender<String>,   // ack_json
+    },
+    EventsCursor(std::sync::mpsc::Sender<String>),          // "<uid>:<bus>:<seq>" or "ERR: dormant"
+    NotifyEvent {
+        pane_id: Option<usize>,       // parsed from caller's TMUX_PANE (%N)
+        pane_instance: Option<u64>,   // caller's PSMUX_PANE_INSTANCE
+        session_uid: String,          // caller's PSMUX_SESSION_UID
+        name: String,                 // "agent-done" | "agent-notify"
+        title_len: usize,
+        content: Option<String>,      // already capped at 4096 by CLI
+        resp: std::sync::mpsc::Sender<String>,  // "OK <seq>" | "STALE" | "ERR: ..."
+    },
+    /// "<u64>" of the targeted pane's data_version. `Some(pane_id)` looks up that
+    /// specific pane (any window, via the same tree-walk as `live_pane_instance`)
+    /// and replies "NOPANE" if it can't be found; `None` keeps the legacy
+    /// active-pane behavior. Used by `capture-pane --settle` so probes and the
+    /// final capture stay pinned to the `-t` target instead of drifting to
+    /// whatever pane is active when a probe happens to consume the temp-focus
+    /// restore (see `is_temp_focus`).
+    PaneDataVersion(Option<usize>, std::sync::mpsc::Sender<String>),
     DisplayMenu(String, Option<i16>, Option<i16>),
     DisplayMenuDirect(Menu),
     DisplayPopup(String, String, String, bool, Option<String>),
@@ -1594,6 +1661,25 @@ pub static PTY_DATA_READY: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Set by the parser thread when any pane's `cpr_pending` flag is raised.
 /// Lets the server loop skip the tree walk when no CPR response is needed.
 pub static CPR_DATA_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once when this (warm) server accepts a `retire-warm` and begins its
+/// terminal teardown. Connection threads check it to refuse `claim-session`
+/// SYNCHRONOUSLY — a claimant must get an explicit `ERR` (its cold-spawn
+/// fallback trigger) no matter where the main loop is in the teardown, because
+/// a claim that has won the `__warm__.port` rename deliberately does not fall
+/// back on a silent/slow response. Never cleared: retirement is one-way.
+pub static WARM_RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Gate that makes the WARM_RETIRING check-and-enqueue atomic. A bare flag
+/// load is not enough: a connection thread can load `false`, be descheduled
+/// for an unbounded time, and enqueue its ClaimSession after the retiring
+/// handler's final drain — silence, which a committed claimant treats as
+/// success. Claim threads hold this across flag-check + enqueue; the
+/// RetireWarm handler sets the flag while holding it. After the handler
+/// releases the gate, every pre-flag sender has provably already enqueued
+/// (one drain-to-empty catches them all) and every later thread sees the
+/// flag — no timing assumptions.
+pub static WARM_CLAIM_GATE: Mutex<()> = Mutex::new(());
 
 /// Issue #440: `pipe-pane` output routing.
 ///
@@ -1818,6 +1904,10 @@ mod tests_issue434_reap_client;
 #[cfg(test)]
 #[path = "../tests-rs/test_kill_descendants_option.rs"]
 mod tests_kill_descendants_option;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_pane_instance.rs"]
+mod test_pane_instance;
 
 #[cfg(test)]
 #[path = "../tests-rs/test_issue450_heal_option.rs"]

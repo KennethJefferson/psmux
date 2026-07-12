@@ -424,3 +424,131 @@ fn liveness_connected_but_silent_is_dead() {
     assert!(start.elapsed() < Duration::from_secs(2), "probe must stay bounded, not hang");
     drop(listener);
 }
+
+#[test]
+fn registry_dir_is_sandboxed_under_cargo_test() {
+    // The whole point of PSMUX_REGISTRY_DIR: `cargo test` must NEVER touch the
+    // user's real ~/.psmux registry (a killed test run used to claim/orphan the
+    // user's live warm server). Under cfg(test) the resolver defaults to a
+    // per-process temp sandbox and exports it so spawned children inherit it.
+    let dir = registry_dir();
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    let real = format!("{}\\.psmux", home);
+    assert!(!dir.eq_ignore_ascii_case(&real), "test registry must not be the real ~/.psmux");
+    assert!(std::path::Path::new(dir).is_dir(), "registry dir is created on first resolution");
+    let exported = std::env::var("PSMUX_REGISTRY_DIR").unwrap_or_default();
+    assert_eq!(exported, dir, "resolved dir is exported for child processes");
+}
+
+#[test]
+fn namespace_has_other_live_session_empty_registry_is_false() {
+    // Sandbox registry starts empty for this namespace: killing the last
+    // session in it must see "no other live session".
+    assert!(!namespace_has_other_live_session(Some("nsholstest_none"), "nsholstest_none__self"));
+}
+
+#[test]
+fn retire_warm_server_is_a_noop_without_a_warm_entry() {
+    // No warm registry entry for this namespace: nothing to contact, no panic,
+    // and nothing new may appear in the registry.
+    let dir = registry_dir();
+    retire_warm_server(Some("rwtest_none"));
+    assert!(!std::path::Path::new(&format!("{}\\rwtest_none____warm__.port", dir)).exists());
+}
+
+#[test]
+fn retire_warm_server_swallows_garbage_and_dead_entries() {
+    // Namespaced warm base so parallel tests scanning the shared sandbox
+    // registry never mistake these fixtures for their own sessions.
+    let dir = registry_dir();
+    let warm_base = "rwtest_dead____warm__";
+    let port_path = format!("{}\\{}.port", dir, warm_base);
+    let key_path = format!("{}\\{}.key", dir, warm_base);
+
+    // Garbage port file: parse fails -> silent no-op, but the retire WON the
+    // rename, so the (useless) pointer is consumed.
+    std::fs::write(&port_path, "not-a-port").unwrap();
+    retire_warm_server(Some("rwtest_dead"));
+    assert!(!std::path::Path::new(&port_path).exists(), "won rename must consume the pointer");
+
+    // Well-formed entry pointing at a dead port: connect fails -> swallowed,
+    // pointer likewise consumed (a dead warm entry must not linger).
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = l.local_addr().unwrap().port();
+    drop(l);
+    std::fs::write(&port_path, dead_port.to_string()).unwrap();
+    std::fs::write(&key_path, "0123456789abcdef").unwrap();
+    retire_warm_server(Some("rwtest_dead"));
+    assert!(!std::path::Path::new(&port_path).exists(), "dead warm pointer must be consumed");
+
+    let _ = std::fs::remove_file(&port_path);
+    let _ = std::fs::remove_file(&key_path);
+}
+
+#[test]
+fn retire_warm_server_loses_the_rename_to_a_claimant() {
+    // Claim-vs-retire mutual exclusion: the claim path commits by atomically
+    // renaming `__warm__.port` away. Once that rename happened, a concurrent
+    // retire must find nothing to rename and walk away — it must NOT contact
+    // (and kill) the warm server the claimant now owns.
+    let dir = registry_dir();
+    let warm_base = "rwtest_claimed____warm__";
+    let port_path = format!("{}\\{}.port", dir, warm_base);
+
+    // A live listener stands in for the warm server mid-claim: if retire
+    // (incorrectly) contacted it, the connect would succeed. The pointer
+    // has already been renamed away by the "claimant".
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_port = l.local_addr().unwrap().port();
+    let claimed_path = format!("{}\\{}.port.claiming", dir, warm_base);
+    std::fs::write(&claimed_path, live_port.to_string()).unwrap(); // claimant's handoff
+    assert!(!std::path::Path::new(&port_path).exists());
+
+    retire_warm_server(Some("rwtest_claimed"));
+
+    // Nothing connected to the listener (no pending accept) and the
+    // claimant's handoff file is untouched.
+    l.set_nonblocking(true).unwrap();
+    assert!(l.accept().is_err(), "retire must not contact a warm owned by a claimant");
+    assert!(std::path::Path::new(&claimed_path).exists(), "claimant handoff must be untouched");
+    let _ = std::fs::remove_file(&claimed_path);
+}
+
+#[test]
+fn namespace_has_other_live_session_dead_entry_is_false_unverifiable_is_true() {
+    let ns = "nsholstest";
+    let dir = registry_dir();
+
+    // A .port pointing at a dead loopback port with a well-formed key file:
+    // probe classifies Dead -> not "present".
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead_listener.local_addr().unwrap().port();
+    drop(dead_listener); // port now refuses connections
+    let dead_base = format!("{}__deadone", ns);
+    std::fs::write(format!("{}\\{}.port", dir, dead_base), dead_port.to_string()).unwrap();
+    std::fs::write(format!("{}\\{}.key", dir, dead_base), "0123456789abcdef").unwrap();
+    assert!(
+        !namespace_has_other_live_session(Some(ns), &format!("{}__self", ns)),
+        "a definitively dead entry must not count as a live session"
+    );
+
+    // No .key at all: identity can't be verified -> Unreachable -> conservative
+    // "present" (kill-session must NOT retire the warm standby on uncertainty).
+    let unver_base = format!("{}__unverifiable", ns);
+    std::fs::write(format!("{}\\{}.port", dir, unver_base), dead_port.to_string()).unwrap();
+    assert!(
+        namespace_has_other_live_session(Some(ns), &format!("{}__self", ns)),
+        "an unverifiable entry must conservatively count as present"
+    );
+
+    // excluded base is ignored even when its files exist
+    let _ = std::fs::remove_file(format!("{}\\{}.port", dir, unver_base));
+    let self_base = format!("{}__self", ns);
+    std::fs::write(format!("{}\\{}.port", dir, self_base), dead_port.to_string()).unwrap();
+    assert!(!namespace_has_other_live_session(Some(ns), &self_base), "own base must be excluded");
+
+    for b in [&dead_base, &unver_base, &self_base] {
+        let _ = std::fs::remove_file(format!("{}\\{}.port", dir, b));
+        let _ = std::fs::remove_file(format!("{}\\{}.key", dir, b));
+    }
+}

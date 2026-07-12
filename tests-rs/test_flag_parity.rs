@@ -988,6 +988,14 @@ fn new_session_compat_flags_D_E_P_X() {
     execute_command_string(&mut app, "new-session -E -s compat2").unwrap();
     execute_command_string(&mut app, "new-session -P -s compat3").unwrap();
     execute_command_string(&mut app, "new-session -X -s compat4").unwrap();
+    // Under cargo test the new-session arm short-circuits after parsing:
+    // no registry files may appear and no server process may spawn. (These
+    // names once claimed and orphaned the USER's real warm server when a
+    // test run was killed mid-flight.)
+    for n in ["compat1", "compat2", "compat3", "compat4"] {
+        let p = format!("{}\\{}.port", crate::session::registry_dir(), n);
+        assert!(!std::path::Path::new(&p).exists(), "unit test leaked registry file {}", p);
+    }
 }
 
 #[test]

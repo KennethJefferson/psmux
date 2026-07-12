@@ -4,6 +4,16 @@ use ratatui::prelude::*;
 use crate::types::{AppState, Pane, Node, LayoutKind, DragState};
 use crate::platform::process_kill;
 
+/// Records a pane that transitioned out of the live tree during a reap pass
+/// (either pruned away, or newly marked dead under remain-on-exit), captured
+/// BEFORE the pane/window is dropped so identity survives for event publishing.
+#[derive(Clone, Debug)]
+pub struct PaneTransition {
+    pub pane_id: usize,
+    pub instance: u64,
+    pub window_id: usize,
+}
+
 /// Split an area into sub-rects with 1px gaps between them for separator lines.
 /// Matches tmux-style gapless panes with single-character separators.
 pub fn split_with_gaps(is_horizontal: bool, sizes: &[u16], area: Rect) -> Vec<Rect> {
@@ -413,12 +423,17 @@ pub fn get_split_mut<'a>(node: &'a mut Node, path: &Vec<usize>) -> Option<&'a mu
 /// - `newly_dead_count` tracks panes that transitioned alive→dead in this call
 ///   (remain-on-exit case), so callers can fire hooks even when the tree shape
 ///   doesn't change.
-pub fn prune_exited(n: Node, remain_on_exit: bool, kill_descendants: bool) -> (Option<Node>, usize) {
+/// - `transitions` collects `(pane_id, instance)` for every pane that leaves
+///   the live tree in this call (pruned away OR newly marked dead), recorded
+///   BEFORE the pane is dropped/marked, so callers can publish identity-bearing
+///   events after the fact.
+pub fn prune_exited(n: Node, remain_on_exit: bool, kill_descendants: bool, transitions: &mut Vec<(usize, u64)>) -> (Option<Node>, usize) {
     match n {
         Node::Leaf(mut p) => {
             if p.dead { return (Some(Node::Leaf(p)), 0); }
             match p.child.try_wait() {
                 Ok(Some(_)) => {
+                    transitions.push((p.id, p.instance));
                     if remain_on_exit {
                         p.dead = true;
                         (Some(Node::Leaf(p)), 1)
@@ -445,7 +460,7 @@ pub fn prune_exited(n: Node, remain_on_exit: bool, kill_descendants: bool) -> (O
             let mut new_sizes: Vec<u16> = Vec::new();
             let mut newly_dead = 0;
             for (i, child) in children.into_iter().enumerate() {
-                let (pruned, dead_count) = prune_exited(child, remain_on_exit, kill_descendants);
+                let (pruned, dead_count) = prune_exited(child, remain_on_exit, kill_descendants, transitions);
                 newly_dead += dead_count;
                 if let Some(c) = pruned {
                     new_children.push(c);
@@ -864,20 +879,24 @@ fn has_any_exited(node: &mut Node) -> bool {
     }
 }
 
-pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool, bool)> {
+pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool, bool, Vec<PaneTransition>)> {
     let remain = app.remain_on_exit;
     let kill_descendants = app.kill_descendants_on_exit();
     let mut any_pruned = false;
     let mut any_newly_dead = false;
+    let mut transitions: Vec<PaneTransition> = Vec::new();
     for i in (0..app.windows.len()).rev() {
         // Fast path: skip full tree rebuild if no panes have exited
         if !has_any_exited(&mut app.windows[i].root) {
             continue;
         }
+        let win_id = app.windows[i].id;
         let leaves_before = count_panes(&app.windows[i].root);
         let active_pane_id = get_active_pane_id(&app.windows[i].root, &app.windows[i].active_path);
         let root = std::mem::replace(&mut app.windows[i].root, Node::Split { kind: LayoutKind::Horizontal, sizes: vec![], children: vec![] });
-        let (pruned_result, newly_dead_count) = prune_exited(root, remain, kill_descendants);
+        let mut pane_transitions: Vec<(usize, u64)> = Vec::new();
+        let (pruned_result, newly_dead_count) = prune_exited(root, remain, kill_descendants, &mut pane_transitions);
+        transitions.extend(pane_transitions.into_iter().map(|(pane_id, instance)| PaneTransition { pane_id, instance, window_id: win_id }));
         if newly_dead_count > 0 {
             any_newly_dead = true;
         }
@@ -926,7 +945,7 @@ pub fn reap_children(app: &mut AppState) -> io::Result<(bool, bool, bool)> {
             }
         }
     }
-    Ok((app.windows.is_empty(), any_pruned, any_newly_dead))
+    Ok((app.windows.is_empty(), any_pruned, any_newly_dead, transitions))
 }
 
 /// Collect all leaf (Pane) nodes from the tree, consuming it.

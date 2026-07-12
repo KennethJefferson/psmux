@@ -21,6 +21,7 @@
   <a href="#usage">Usage</a> ·
   <a href="docs/use-cases.md">Use Cases</a> ·
   <a href="docs/claude-code.md">Claude Code</a> ·
+  <a href="docs/agent-events.md">Agent Events</a> ·
   <a href="docs/features.md">Features</a> ·
   <a href="docs/compatibility.md">Compatibility</a> ·
   <a href="docs/performance.md">Performance</a> ·
@@ -157,6 +158,7 @@ No extra configuration needed. Full guide: **[docs/claude-code.md](docs/claude-c
 | **[Plugins & Themes](docs/plugins.md)** | Plugin ecosystem — Catppuccin, Dracula, Nord, and more |
 | **[Mouse Over SSH](docs/mouse-ssh.md)** | SSH mouse support and Windows version requirements |
 | **[Claude Code](docs/claude-code.md)** | Agent teams integration guide |
+| **[Agent Events](docs/agent-events.md)** | Deterministic agent orchestration — cursor/events/wait-event, notify/hooks, capture-pane --settle |
 | **[FAQ](docs/faq.md)** | Common questions and answers |
 
 ## Related Projects

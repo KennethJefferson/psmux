@@ -161,8 +161,15 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
                 crate::warm_pane_sync::reconcile_consumed_parser(&mut parser, app);
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
+            // If this spare was spawned pre-claim (__warm__ pool; no identity
+            // env at all), mint a fresh instance now. If it was spawned by a
+            // live session replenishing its own pool, its env already has a
+            // baked-in instance (see spawn_warm_pane / WarmPane::minted_instance)
+            // that can never be changed post-spawn — reuse it verbatim so the
+            // tree stays in sync with what the live process actually reports.
+            let pane_instance = wp.minted_instance.unwrap_or_else(|| app.alloc_pane_instance());
             let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
-            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
+            let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, instance: pane_instance, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
             if let Some(dir) = start_dir {
                 silent_rehome(&mut pane, dir);
@@ -203,8 +210,9 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     if let Some(dir) = start_dir {
         shell_cmd.cwd(std::path::Path::new(dir));
     }
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     apply_user_environment(&mut shell_cmd, &app.environment);
+    let pane_instance = app.alloc_pane_instance();
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, pane_instance, &app.session_uid, &app.bus_id_string(), app.claude_code_fix_tty, app.claude_code_force_interactive);
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -242,7 +250,7 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: pane_id, instance: pane_instance, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
     app.next_pane_id += 1;
     let win_name = command.map(|c| default_shell_name(Some(c), None)).unwrap_or_else(|| default_shell_name(None, configured_shell));
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
@@ -286,8 +294,26 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     };
     let pane_id = app.next_pane_id;
     app.next_pane_id += 1;
-    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     apply_user_environment(&mut shell_cmd, &app.environment);
+    // A genuine pre-claim `__warm__` server has an empty session_uid here, so
+    // set_tmux_env no-ops the whole identity-env block and no instance is
+    // baked in (transplant mints one fresh once the session is real).
+    //
+    // BUT a live, already-claimed session also calls spawn_warm_pane to
+    // replenish its OWN pool (server startup's "early warm" pane, and the
+    // idle-loop/post-window replenish) — at those call sites app.session_uid
+    // is ALREADY minted. The instance must be allocated NOW and baked into
+    // this env, because it can never be changed after the child spawns:
+    // transplanting this pane later must reuse the SAME value, not allocate
+    // a second one, or the live process's real PSMUX_PANE_INSTANCE permanently
+    // disagrees with the tree's Pane.instance and every notify/hook-notify
+    // from that pane is rejected as stale (see WarmPane::minted_instance).
+    let minted_instance = if app.session_uid.is_empty() {
+        None
+    } else {
+        Some(app.alloc_pane_instance())
+    };
+    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, minted_instance.unwrap_or(0), &app.session_uid, &app.bus_id_string(), app.claude_code_fix_tty, app.claude_code_force_interactive);
     let child = pair.slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
@@ -314,7 +340,7 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, child_pid, pane_id, rows, cols, output_ring })
+    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, child_pid, pane_id, rows, cols, output_ring, minted_instance })
 }
 
 pub fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
@@ -332,8 +358,9 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
 
     let mut shell_cmd = build_raw_command(raw_args);
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     apply_user_environment(&mut shell_cmd, &app.environment);
+    let pane_instance = app.alloc_pane_instance();
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, pane_instance, &app.session_uid, &app.bus_id_string(), app.claude_code_fix_tty, app.claude_code_force_interactive);
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -368,7 +395,7 @@ pub fn create_window_raw(pty_system: &dyn portable_pty::PtySystem, app: &mut App
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let raw_pane_id = app.next_pane_id;
-    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
+    let pane = Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: raw_pane_id, instance: pane_instance, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) };
     app.next_pane_id += 1;
     let win_name = std::path::Path::new(&raw_args[0]).file_stem().and_then(|s| s.to_str()).unwrap_or(&raw_args[0]).to_string();
     app.windows.push(Window { root: Node::Leaf(pane), active_path: vec![], name: win_name, id: app.next_win_id, activity_flag: false, bell_flag: false, silence_flag: false, last_output_time: std::time::Instant::now(), last_seen_version: 0, manual_rename: false, layout_index: 0, pane_mru: vec![raw_pane_id], zoom_saved: None, linked_from: None, floating: Vec::new(), floating_focus: None });
@@ -477,7 +504,14 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let new_pane_id = wp.pane_id;
-            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
+            // If this spare was spawned pre-claim (__warm__ pool; no identity
+            // env at all), mint a fresh instance now. If it was spawned by a
+            // live session replenishing its own pool, its env already has a
+            // baked-in instance (see spawn_warm_pane / WarmPane::minted_instance)
+            // that can never be changed post-spawn — reuse it verbatim so the
+            // tree stays in sync with what the live process actually reports.
+            let pane_instance = wp.minted_instance.unwrap_or_else(|| app.alloc_pane_instance());
+            let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, instance: pane_instance, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring, spawned_at: Some(std::time::Instant::now()) };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
             if let Some(dir) = start_dir {
                 silent_rehome(&mut new_pane, dir);
@@ -512,8 +546,9 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     if let Some(dir) = start_dir {
         shell_cmd.cwd(std::path::Path::new(dir));
     }
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     apply_user_environment(&mut shell_cmd, &app.environment);
+    let pane_instance = app.alloc_pane_instance();
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, pane_instance, &app.session_uid, &app.bus_id_string(), app.claude_code_fix_tty, app.claude_code_force_interactive);
     let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
     // Close the slave handle immediately – see create_window() comment.
     drop(pair.slave);
@@ -538,7 +573,7 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
     conpty_preemptive_dsr_response(&mut *pty_writer);
     let epoch = std::time::Instant::now() - Duration::from_secs(2);
     let split_pane_id = app.next_pane_id;
-    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) });
+    let new_leaf = Node::Leaf(Pane { master: pair.master, writer: pty_writer, child, term, last_rows: size.rows, last_cols: size.cols, id: split_pane_id, instance: pane_instance, title: hostname_cached(), title_locked: false, child_pid, data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape, bell_pending, cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring, spawned_at: Some(std::time::Instant::now()) });
     app.next_pane_id += 1;
     let win = &mut app.windows[app.active_idx];
     replace_leaf_with_split(&mut win.root, &win.active_path, kind, new_leaf);
@@ -679,7 +714,18 @@ pub fn apply_bare_env_if_set(builder: &mut CommandBuilder) -> bool {
 /// TMUX_PANE format: %{pane_id}
 /// PSMUX_SESSION: actual session name (for Claude Code / tool detection)
 /// The socket_name component encodes the -L namespace for child process resolution.
-pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: Option<u16>, socket_name: Option<&str>, session_name: &str, fix_tty: bool, _force_interactive: bool) {
+pub fn set_tmux_env(
+    builder: &mut CommandBuilder,
+    pane_id: usize,
+    control_port: Option<u16>,
+    socket_name: Option<&str>,
+    session_name: &str,
+    pane_instance: u64,
+    session_uid: &str,
+    bus_id: &str,
+    fix_tty: bool,
+    _force_interactive: bool,
+) {
     let server_pid = std::process::id();
     let port = control_port.unwrap_or(0);
     let sn = socket_name.unwrap_or("default");
@@ -691,6 +737,15 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: 
     // real session name.  Tools like Claude Code can use PSMUX_SESSION for explicit
     // psmux detection (e.g. `if (process.env.PSMUX_SESSION) return 'psmux'`).
     builder.env("PSMUX_SESSION", session_name);
+    // Identity env: only minted once the session has a real (non-dormant) uid.
+    // Warm (`__warm__`) servers stay dormant (empty session_uid) until claimed,
+    // so warm-transplanted panes never get these — by design (they fail stale
+    // validation against the post-claim identity).
+    if !session_uid.is_empty() {
+        builder.env("PSMUX_SESSION_UID", session_uid);
+        builder.env("PSMUX_BUS_ID", bus_id);
+        builder.env("PSMUX_PANE_INSTANCE", format!("{}", pane_instance));
+    }
     // Prevent MSYS2/Git-Bash from path-mangling the TMUX value (which starts
     // with /tmp/ and would be rewritten to a Windows path otherwise).
     builder.env("MSYS2_ENV_CONV_EXCL", "TMUX");
@@ -715,11 +770,25 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: 
 
 }
 
+/// Env keys minted by psmux that user/session environment must never override.
+/// Matched case-insensitively (Windows env keys are case-insensitive).
+/// PSMUX_HOOKS_DISABLED is deliberately NOT protected (user kill-switch).
+pub const PROTECTED_ENV_KEYS: &[&str] = &[
+    "TMUX", "TMUX_PANE", "PSMUX_SESSION",
+    "PSMUX_SESSION_UID", "PSMUX_BUS_ID", "PSMUX_PANE_INSTANCE",
+];
+
+pub fn is_protected_env_key(key: &str) -> bool {
+    PROTECTED_ENV_KEYS.iter().any(|p| p.eq_ignore_ascii_case(key))
+}
+
 /// Apply user-defined environment variables (from set-environment -g) to a CommandBuilder.
 /// This ensures variables set via config or runtime `set-environment` are explicitly
 /// passed to every child pane, in addition to process inheritance.
+/// Protected keys (psmux-minted env vars) are skipped to ensure they are not overridden.
 pub fn apply_user_environment(builder: &mut CommandBuilder, environment: &std::collections::HashMap<String, String>) {
     for (key, value) in environment {
+        if is_protected_env_key(key) { continue; }
         builder.env(key, value);
     }
 }
@@ -1796,6 +1865,10 @@ mod test_parser_audible_bell {
         assert!(!bell_after_two_chunks(b"\x1b]0;title", b"\x07"));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_env_protected.rs"]
+mod test_env_protected;
 
 // reap_children is in tree.rs
 

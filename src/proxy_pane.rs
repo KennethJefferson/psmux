@@ -256,6 +256,8 @@ pub fn create_proxy_pane(
         last_rows: rows,
         last_cols: cols,
         id: pane_id,
+        // Cross-session forwarded proxy pane: not a real spawn site, no identity.
+        instance: 0,
         title,
         title_locked: false,
         child_pid: pid,

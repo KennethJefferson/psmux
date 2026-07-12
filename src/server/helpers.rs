@@ -271,10 +271,13 @@ pub(crate) fn check_window_activity(app: &mut AppState) -> Vec<&'static str> {
     let bell_action = app.bell_action.clone();
     let mut triggered_hooks: Vec<&'static str> = Vec::new();
     let mut forward_bell = false;
+    // (pane_id, instance) pairs whose bell fired this pass, collected so we
+    // can publish `pane-bell` events after the borrow of app.windows ends.
+    let mut belled_panes: Vec<(usize, u64)> = Vec::new();
 
     for (i, win) in app.windows.iter_mut().enumerate() {
         // ── Bell detection: check all panes for pending bells ──
-        let has_bell = check_pane_bells(&win.root);
+        let has_bell = check_pane_bells(&win.root, &mut belled_panes);
         if has_bell && i != active {
             // Apply bell-action: "any" = always, "current" = only active (skip),
             // "other" = only non-active (this path), "none" = never
@@ -337,6 +340,9 @@ pub(crate) fn check_window_activity(app: &mut AppState) -> Vec<&'static str> {
     }
     if forward_bell {
         app.bell_forward = true;
+    }
+    for (pane_id, instance) in belled_panes {
+        let _ = app.bus.publish("pane-bell", "pane", Some(pane_id), Some(instance), serde_json::json!({}));
     }
     triggered_hooks
 }
@@ -435,16 +441,22 @@ fn propagate_osc_titles_in_tree(node: &mut Node, dirty: &mut bool) {
 }
 
 /// Walk a pane tree and check/consume bell_pending flags.
-/// Returns true if any pane had a pending bell.
-fn check_pane_bells(node: &Node) -> bool {
+/// Returns true if any pane had a pending bell. Every pane whose bell fired
+/// is appended to `belled` as `(pane_id, instance)` so callers can publish
+/// identity-bearing `pane-bell` events.
+fn check_pane_bells(node: &Node, belled: &mut Vec<(usize, u64)>) -> bool {
     match node {
-        Node::Leaf(p) => p
-            .bell_pending
-            .swap(false, std::sync::atomic::Ordering::AcqRel),
+        Node::Leaf(p) => {
+            let fired = p.bell_pending.swap(false, std::sync::atomic::Ordering::AcqRel);
+            if fired {
+                belled.push((p.id, p.instance));
+            }
+            fired
+        }
         Node::Split { children, .. } => {
             let mut any = false;
             for c in children {
-                if check_pane_bells(c) {
+                if check_pane_bells(c, belled) {
                     any = true;
                 }
             }
@@ -498,6 +510,7 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "command-prompt",
     "confirm-before (confirm)",
     "copy-mode",
+    "cursor",
     "customize-mode",
     "delete-buffer (deleteb)",
     "detach-client (detach)",
@@ -505,8 +518,10 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "display-message (display)",
     "display-panes (displayp)",
     "display-popup (popup)",
+    "events",
     "find-window (findw)",
     "has-session (has)",
+    "hook-notify",
     "if-shell (if)",
     "join-pane (joinp)",
     "kill-pane (killp)",
@@ -533,6 +548,7 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "new-window (neww)",
     "next-layout (nextl)",
     "next-window (next)",
+    "notify",
     "paste-buffer (pasteb)",
     "pipe-pane (pipep)",
     "previous-layout (prevl)",
@@ -574,6 +590,7 @@ pub(crate) const TMUX_COMMANDS: &[&str] = &[
     "switch-client (switchc)",
     "unbind-key (unbind)",
     "unlink-window (unlinkw)",
+    "wait-event",
     "wait-for (wait)",
 ];
 
