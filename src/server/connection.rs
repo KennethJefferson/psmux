@@ -3125,18 +3125,41 @@ match cmd {
         let mut names = Vec::new();
         let mut categories = Vec::new();
         let mut after = None;
+        let mut bad_cursor = false;
         for a in &args {
             if let Some(v) = a.strip_prefix("name=") { names.push(v.to_string()); }
             else if let Some(v) = a.strip_prefix("category=") { categories.push(v.to_string()); }
-            else if let Some(v) = a.strip_prefix("after=") { after = crate::events::Cursor::parse(v); }
+            else if let Some(v) = a.strip_prefix("after=") {
+                after = crate::events::Cursor::parse(v);
+                if after.is_none() { bad_cursor = true; }
+            }
+        }
+        if bad_cursor {
+            let _ = write!(write_stream, "{{\"type\":\"error\",\"error\":\"bad cursor\"}}\n");
+            let _ = write_stream.flush();
+            break; // malformed after= must not silently fall back to live-only
         }
         let (sub_tx, sub_rx) = std::sync::mpsc::sync_channel(crate::events::SUB_CHANNEL_CAP);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel::<String>();
         let _ = tx.send(CtrlReq::EventsSubscribe { names, categories, after, tx: sub_tx, ack: ack_tx });
-        if let Ok(ack) = ack_rx.recv() {
-            if write!(write_stream, "{}\n", ack).is_err() { break; }
+        let refused = match ack_rx.recv() {
+            Ok(ack) => {
+                let is_refused = serde_json::from_str::<serde_json::Value>(&ack)
+                    .ok()
+                    .and_then(|v| v.get("refused").cloned())
+                    .map(|v| !v.is_null())
+                    .unwrap_or(false);
+                if write!(write_stream, "{}\n", ack).is_err() { break; }
+                let _ = write_stream.flush();
+                is_refused
+            }
+            Err(_) => break,
+        };
+        if refused {
+            let _ = write!(write_stream, "{{\"type\":\"closed\",\"reason\":\"max_subscribers\"}}\n");
             let _ = write_stream.flush();
-        } else { break; }
+            break; // registration was refused; nothing to stream
+        }
         // stream until closed/disconnect; recv timeout bounds the write-liveness check
         loop {
             match sub_rx.recv_timeout(std::time::Duration::from_secs(crate::events::HEARTBEAT_SECS + 5)) {
@@ -3205,6 +3228,7 @@ match cmd {
                 Some(a) => a, None => return "ERR: server".into(),
             };
             if ack.get("mismatch").and_then(|x| x.as_bool()) == Some(true) { return "MISMATCH".into(); }
+            if ack.get("refused").map(|x| !x.is_null()) == Some(true) { return "ERR: max subscribers".into(); }
             if ack.get("gap").and_then(|x| x.as_bool()) == Some(true) { return "GAP".into(); }
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
             loop {

@@ -112,3 +112,24 @@ fn close_all_sends_terminal() {
     b.close_all("bus-closed");
     match rx.try_recv().unwrap() { SubscriberMsg::Closed(r) => assert_eq!(r, "bus-closed"), _ => panic!() }
 }
+
+#[test]
+fn subscriber_cap_refuses_65th() {
+    let mut b = active_bus();
+    // Keep every receiver alive so the bus can't prune any of them as
+    // disconnected — the cap must be enforced on its own terms, not because
+    // of channel cleanup.
+    let mut kept_rx = Vec::new();
+    for _ in 0..MAX_SUBSCRIBERS {
+        let (tx, rx) = sync_channel(SUB_CHANNEL_CAP);
+        let ack = b.subscribe(vec![], vec![], None, tx);
+        assert!(!ack.refused);
+        kept_rx.push(rx);
+    }
+    assert_eq!(b.subscriber_count(), MAX_SUBSCRIBERS);
+    let (tx65, _rx65) = sync_channel(SUB_CHANNEL_CAP);
+    let ack65 = b.subscribe(vec![], vec![], None, tx65);
+    assert!(ack65.refused);
+    assert!(ack65.ack_json.contains("\"refused\":\"max_subscribers\""));
+    assert_eq!(b.subscriber_count(), MAX_SUBSCRIBERS);
+}

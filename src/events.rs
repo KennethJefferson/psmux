@@ -48,6 +48,11 @@ pub const RING_CAP: usize = 4096;
 pub const SUB_CHANNEL_CAP: usize = 8192; // > RING_CAP so replay can never block
 pub const MAX_EVENT_BYTES: usize = 16 * 1024;
 pub const HEARTBEAT_SECS: u64 = 15;
+/// Hard cap on concurrent subscribers per bus (spec §4 honesty: v1 ships a
+/// fixed cap, not the deferred per-pane/global rate limiter). The 65th
+/// concurrent `events`/`wait-event` caller is refused registration rather
+/// than growing `subs` unbounded.
+pub const MAX_SUBSCRIBERS: usize = 64;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Event {
@@ -87,6 +92,7 @@ pub struct SubscribeAck {
     pub ack_json: String,
     pub gap: bool,
     pub mismatch: bool,
+    pub refused: bool,
 }
 
 pub struct EventBus {
@@ -192,9 +198,14 @@ impl EventBus {
                 }
             }
         };
+        // Cap enforced before registration, not before the mismatch/gap
+        // computation above: a mismatched cursor is already refused
+        // registration on its own terms, and reporting mismatch takes
+        // precedence over reporting "refused" for that case.
+        let refused = !mismatch && self.subs.len() >= MAX_SUBSCRIBERS;
         let sub = Subscriber { tx, names, categories };
         let mut replay_count = 0u64;
-        if !mismatch {
+        if !mismatch && !refused {
             for ev in self.ring.iter().filter(|e| e.seq > from_seq) {
                 if sub.accepts(ev) {
                     // capacity SUB_CHANNEL_CAP > RING_CAP: cannot block on a fresh channel
@@ -210,13 +221,14 @@ impl EventBus {
             "oldest_seq": self.oldest_seq(),
             "latest_seq": self.seq,
             "replay_count": replay_count,
-            "gap": gap,
+            "gap": if refused { false } else { gap },
             "gap_reason": gap_reason,
             "mismatch": mismatch,
+            "refused": if refused { serde_json::Value::String("max_subscribers".to_string()) } else { serde_json::Value::Null },
         })
         .to_string();
-        if !mismatch { self.subs.push(sub); }
-        SubscribeAck { ack_json, gap, mismatch }
+        if !mismatch && !refused { self.subs.push(sub); }
+        SubscribeAck { ack_json, gap, mismatch, refused }
     }
 
     /// Periodic heartbeat fan-out; call from the main loop every HEARTBEAT_SECS.
