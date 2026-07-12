@@ -686,6 +686,10 @@ pub mod mouse_inject {
     /// which sets only ENABLE_WINDOW_INPUT), VT mouse sequences should NOT
     /// be written because the app cannot parse them and they appear as garbage.
     pub fn query_vti_enabled(child_pid: u32) -> Option<bool> {
+        // Hold across the FreeConsole/AttachConsole dance so a concurrent
+        // ConPTY spawn can't stamp freed std handles into a newborn shell
+        // (issue #450).  Same guard in every dance function below.
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -770,6 +774,7 @@ pub mod mouse_inject {
             }
         }
 
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             // Check if we currently own a console (app mode yes, server mode no after first call)
             let had_console = reattach && GetConsoleWindow() != 0;
@@ -870,6 +875,7 @@ pub mod mouse_inject {
     /// child reads input as text (ReadConsole/ReadFile) and expects VT
     /// mouse sequences delivered as KEY_EVENT records (nvim, vim).
     pub fn query_mouse_input_enabled(child_pid: u32) -> Option<bool> {
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -936,6 +942,7 @@ pub mod mouse_inject {
     /// ConPTY's input engine may not correctly handle SGR mouse sequences
     /// written to hInput.
     pub fn send_vt_sequence(child_pid: u32, sequence: &[u8]) -> bool {
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -1057,6 +1064,7 @@ pub mod mouse_inject {
     /// The text is encoded as UTF-16 for proper Unicode support (file paths
     /// may contain non-ASCII characters).
     pub fn send_bracketed_paste(child_pid: u32, text: &str, bracket: bool) -> bool {
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -1279,6 +1287,7 @@ pub mod mouse_inject {
         let fg_is_shell = crate::platform::process_info::foreground_is_shell(child_pid)
             .unwrap_or(true);
 
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = reattach && GetConsoleWindow() != 0;
 
@@ -1458,6 +1467,7 @@ pub mod mouse_inject {
             }
         }
 
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = reattach && GetConsoleWindow() != 0;
 
@@ -1541,6 +1551,7 @@ pub mod mouse_inject {
     /// `u_char` = the plain char; for Ctrl+Alt: `u_char` = control character.
     /// Sends both key-down and key-up events for proper event pairing.
     pub fn send_modified_key_event(child_pid: u32, ch: char, ctrl: bool, alt: bool, shift: bool) -> bool {
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();
@@ -1672,6 +1683,7 @@ pub mod mouse_inject {
     /// KEY_EVENT_RECORD with the correct modifier flags, so PSReadLine and
     /// other console-API-based readers see the true Shift/Ctrl/Alt+Enter.
     pub fn send_modified_enter_event(child_pid: u32, ctrl: bool, alt: bool, shift: bool) -> bool {
+        let _console_guard = portable_pty::console_state_lock();
         unsafe {
             let had_console = GetConsoleWindow() != 0;
             FreeConsole();

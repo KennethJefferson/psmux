@@ -247,6 +247,30 @@ impl PsuedoCon {
 
         let cwd = cmd.current_directory();
 
+        // The child's ProcessParameters std handles are stamped from this
+        // process's std handle slots at CreateProcessW time.  Hold the console
+        // state lock so no FreeConsole/AttachConsole dance (Ctrl+C delivery,
+        // mouse/VT injection) is mid-flight on another thread, and park the
+        // slots on NULL for the duration of the call: after any dance the
+        // slots of a headless server dangle on freed, recycled handle values,
+        // and a child born from them dies at its first console read
+        // (issue #450).  A NULL-std parent is the GUI-parent case, for which
+        // conhost always hands the child fresh handles to its own console.
+        let _console_guard = crate::console_state_lock();
+        let saved_std = unsafe {
+            use winapi::um::processenv::{GetStdHandle, SetStdHandle};
+            use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+            let saved = (
+                GetStdHandle(STD_INPUT_HANDLE),
+                GetStdHandle(STD_OUTPUT_HANDLE),
+                GetStdHandle(STD_ERROR_HANDLE),
+            );
+            SetStdHandle(STD_INPUT_HANDLE, ptr::null_mut());
+            SetStdHandle(STD_OUTPUT_HANDLE, ptr::null_mut());
+            SetStdHandle(STD_ERROR_HANDLE, ptr::null_mut());
+            saved
+        };
+
         let res = unsafe {
             CreateProcessW(
                 exe.as_mut_slice().as_mut_ptr(),
@@ -263,8 +287,16 @@ impl PsuedoCon {
                 &mut pi,
             )
         };
+        let create_err = IoError::last_os_error();
+        unsafe {
+            use winapi::um::processenv::SetStdHandle;
+            use winapi::um::winbase::{STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+            SetStdHandle(STD_INPUT_HANDLE, saved_std.0);
+            SetStdHandle(STD_OUTPUT_HANDLE, saved_std.1);
+            SetStdHandle(STD_ERROR_HANDLE, saved_std.2);
+        }
         if res == 0 {
-            let err = IoError::last_os_error();
+            let err = create_err;
             let msg = format!(
                 "CreateProcessW `{:?}` in cwd `{:?}` failed: {}",
                 cmd_os,

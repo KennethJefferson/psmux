@@ -1728,7 +1728,86 @@ pub fn respawn_active_pane(app: &mut AppState, pty_system_ref: Option<&dyn porta
     pane.vti_mode_cache = None;
     pane.mouse_input_cache = None;
     pane.dead = false;
-    
+    pane.spawned_at = Some(std::time::Instant::now());
+
+    Ok(())
+}
+
+/// Respawn a fresh default shell into a SPECIFIC pane (by window index + tree
+/// path) that crashed shortly after spawn. Mirrors `respawn_active_pane`'s spawn
+/// core but always uses the default shell and targets an arbitrary pane. Used by
+/// the opt-in `@heal-crashed-panes` self-heal for issue #450, where a pwsh whose
+/// PSReadLine is not the active reader FailFasts on its first ConPTY read right
+/// after a warm-pane transplant, leaving a broken/empty window.
+pub fn heal_respawn_pane(
+    app: &mut AppState,
+    pty_system_ref: &dyn portable_pty::PtySystem,
+    win_idx: usize,
+    path: &Vec<usize>,
+) -> io::Result<()> {
+    // Expand format vars (e.g. #{pane_current_path}) before the mutable borrow.
+    let expanded_shell = crate::format::expand_format(&app.default_shell, &app);
+    // A healed pane keeps its pane id but gets a FRESH shell process, so it
+    // must never reuse the crashed shell's instance — downstream event
+    // consumers use (pane_id, instance) to detect the swap. Same contract as
+    // respawn_active_pane above; snapshotted before the mutable borrow.
+    let new_instance = app.alloc_pane_instance();
+    let session_uid = app.session_uid.clone();
+    let bus_id = app.bus_id_string();
+
+    let Some(win) = app.windows.get_mut(win_idx) else { return Ok(()); };
+    let Some(pane) = active_pane_mut(&mut win.root, path) else { return Ok(()); };
+    let pane_id = pane.id;
+    let size = PtySize { rows: pane.last_rows.max(1), cols: pane.last_cols.max(1), pixel_width: 0, pixel_height: 0 };
+
+    let pair = pty_system_ref.openpty(size).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("openpty error: {e}")))?;
+    let mut shell_cmd = if !expanded_shell.is_empty() {
+        build_default_shell(&expanded_shell, app.env_shim, app.allow_predictions)
+    } else {
+        detect_shell()
+    };
+    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, new_instance, &session_uid, &bus_id, app.claude_code_fix_tty, app.claude_code_force_interactive);
+    crate::pane::apply_user_environment(&mut shell_cmd, &app.environment);
+    let child = pair.slave.spawn_command(shell_cmd).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
+    drop(pair.slave);
+    let child_pid = crate::platform::mouse_inject::get_child_pid(&*child);
+
+    let term: Arc<Mutex<vt100::Parser>> = Arc::new(Mutex::new(vt100::Parser::new(size.rows, size.cols, app.history_limit)));
+    let term_reader = term.clone();
+    let reader = pair.master.try_clone_reader().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("clone reader error: {e}")))?;
+    let data_version = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dv_writer = data_version.clone();
+    let cursor_shape = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(crate::pane::CURSOR_SHAPE_UNSET));
+    let cs_writer = cursor_shape.clone();
+    let bell_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bell_writer = bell_pending.clone();
+    let cpr_pending = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cpr_writer = cpr_pending.clone();
+    let output_ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new()));
+    crate::pane::spawn_reader_thread(reader, term_reader, dv_writer, cs_writer, bell_writer, cpr_writer, output_ring.clone(), pane_id);
+
+    let mut pty_writer = pair.master.take_writer().map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
+    crate::pane::conpty_preemptive_dsr_response(&mut *pty_writer);
+
+    // Re-acquire the pane and swap in the fresh shell.
+    let Some(win) = app.windows.get_mut(win_idx) else { return Ok(()); };
+    let Some(pane) = active_pane_mut(&mut win.root, path) else { return Ok(()); };
+    pane.master = pair.master;
+    pane.writer = pty_writer;
+    pane.child = child;
+    pane.term = term;
+    pane.instance = new_instance;
+    pane.data_version = data_version;
+    pane.cursor_shape = cursor_shape;
+    pane.bell_pending = bell_pending;
+    pane.cpr_pending = cpr_pending;
+    pane.output_ring = output_ring;
+    pane.child_pid = child_pid;
+    pane.vt_bridge_cache = None;
+    pane.vti_mode_cache = None;
+    pane.mouse_input_cache = None;
+    pane.dead = false;
+    pane.spawned_at = Some(std::time::Instant::now());
     Ok(())
 }
 

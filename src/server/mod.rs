@@ -5776,6 +5776,45 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     app.warm_pane = Some(nw);
                 }
             }
+            // #450 (opt-in `@heal-crashed-panes`): a shell can FailFast on its
+            // very first ConPTY read right after a warm-pane transplant (pwsh
+            // whose PSReadLine is not the active reader hits ERROR_INVALID_PARAMETER
+            // in its fallback ReadLineFromFile). The pane passed the consume-time
+            // liveness gate, then died a beat later, so the reaper would prune it
+            // to a broken/empty window. If a pane's shell exits within a short
+            // grace window of being spawned, treat it as crash-on-startup and
+            // respawn a fresh shell IN PLACE (at most once per pane) so the user
+            // still gets a working window. Runs BEFORE reap so the revived pane
+            // is not pruned.
+            if app.heal_crashed_panes() {
+                let grace = Duration::from_millis(4000);
+                let mut to_heal: Vec<(usize, Vec<usize>, usize)> = Vec::new();
+                for wi in 0..app.windows.len() {
+                    for id in tree::collect_pane_ids(&app.windows[wi].root) {
+                        if app.healed_pane_ids.contains(&id) { continue; }
+                        let Some(path) = tree::find_path_by_id(&app.windows[wi].root, id) else { continue; };
+                        if let Some(pane) = tree::active_pane_mut(&mut app.windows[wi].root, &path) {
+                            let young = pane.spawned_at.map(|t| t.elapsed() < grace).unwrap_or(false);
+                            if !young { continue; }
+                            if matches!(pane.child.try_wait(), Ok(Some(_))) {
+                                to_heal.push((wi, path, id));
+                            }
+                        }
+                    }
+                }
+                for (wi, path, id) in to_heal {
+                    match crate::window_ops::heal_respawn_pane(&mut app, &*pty_system, wi, &path) {
+                        Ok(()) => {
+                            app.healed_pane_ids.insert(id);
+                            state_dirty = true;
+                            crate::debug_log::server_log("heal", &format!(
+                                "respawned crashed pane {} in window {} (@heal-crashed-panes)", id, wi));
+                        }
+                        Err(e) => crate::debug_log::server_log("heal", &format!(
+                            "heal respawn failed for pane {}: {}", id, e)),
+                    }
+                }
+            }
             // Snapshot per-window state BEFORE reap so we can diff and emit
             // accurate %window-close / %layout-change / %window-pane-changed
             // notifications to control-mode clients (iTerm2 etc.).  Without

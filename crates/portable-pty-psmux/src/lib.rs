@@ -401,6 +401,23 @@ pub fn native_pty_system() -> Box<dyn PtySystem + Send> {
     Box::new(NativePtySystem::default())
 }
 
+/// Serializes process-global console identity changes against ConPTY spawns.
+///
+/// On Windows, FreeConsole/AttachConsole swap the whole process's console
+/// connection and its std handle slots.  CreateProcessW for a ConPTY child
+/// (bInheritHandles=FALSE, no STARTF_USESTDHANDLES) stamps the parent's
+/// std handle *values* into the child's ProcessParameters at that instant;
+/// a spawn landing inside another thread's FreeConsole/AttachConsole window
+/// gives the child freed, recycled handle values and the shell dies at its
+/// first console read (psmux issue #450).  Every FreeConsole/AttachConsole
+/// dance and every ConPTY spawn must hold this lock.
+pub fn console_state_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A panic while holding the lock leaves console state possibly odd but
+    // the lock itself must keep working (see psmux issue #446).
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(unix)]
 pub type NativePtySystem = unix::UnixPtySystem;
 #[cfg(windows)]

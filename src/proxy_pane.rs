@@ -279,5 +279,8 @@ pub fn create_proxy_pane(
         pane_style: None,
         squelch_until: None,
         output_ring: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+        // Proxy panes mirror a remote pane's ConPTY; respawning a local shell
+        // here would be wrong, so they are never auto-healed.
+        spawned_at: None,
     })
 }

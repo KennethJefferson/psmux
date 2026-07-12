@@ -165,6 +165,14 @@ pub struct Pane {
     /// Per-pane output ring buffer for control mode %output notifications.
     /// Filled by the PTY reader thread, drained by the server loop.
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
+    /// When the pane's shell was spawned (monotonic), and only for panes that
+    /// carry a real, restartable default shell. `None` for popup, proxy, and
+    /// empty (`-E`) panes, which must never be auto-respawned. Used by the
+    /// opt-in `@heal-crashed-panes` self-heal: a shell that exits within a
+    /// short grace window of spawn is treated as a crash-on-startup (e.g. the
+    /// #450 pwsh `ReadLineFromFile` FailFast right after a warm-pane transplant)
+    /// and respawned in place, so the user still gets a working window.
+    pub spawned_at: Option<Instant>,
 }
 
 /// Pre-spawned shell ready to be transplanted into a new window instantly.
@@ -545,6 +553,11 @@ pub struct AppState {
     pub created_at: chrono::DateTime<Local>,
     pub next_win_id: usize,
     pub next_pane_id: usize,
+    /// Pane ids already auto-healed once by `@heal-crashed-panes`. A pane is
+    /// respawned at most once so a shell that crashes on every startup can't
+    /// spin an infinite respawn loop; after one heal it falls through to the
+    /// normal reap path.
+    pub healed_pane_ids: std::collections::HashSet<usize>,
     /// Whether the attached client is currently in prefix mode (for `client_prefix` format var).
     pub client_prefix_active: bool,
     pub sync_input: bool,
@@ -824,6 +837,24 @@ impl AppState {
         }
     }
 
+    /// Opt-in self-heal for shells that crash immediately after spawn (issue
+    /// #450). When a newly created pane's shell exits within
+    /// `HEAL_CRASHED_PANE_GRACE` of being spawned, treat it as a
+    /// crash-on-startup (rather than a deliberate `exit`) and respawn a fresh
+    /// shell in place instead of pruning the window. Defaults OFF because it is
+    /// only needed on environments where pwsh's non-PSReadLine fallback reader
+    /// FailFasts on the first ConPTY read; enable per-user with
+    /// `set -g @heal-crashed-panes on`.
+    pub fn heal_crashed_panes(&self) -> bool {
+        match self.user_options.get("@heal-crashed-panes") {
+            Some(v) => matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "on" | "1" | "true" | "yes"
+            ),
+            None => false,
+        }
+    }
+
     /// Reap a dead client's `client_registry` entry exactly once, keeping the
     /// `attached_clients` counter in lock-step with the registry.
     ///
@@ -1036,6 +1067,7 @@ impl AppState {
             created_at: Local::now(),
             next_win_id: 1,
             next_pane_id: 1,
+            healed_pane_ids: std::collections::HashSet::new(),
             client_prefix_active: false,
             sync_input: false,
             hooks: std::collections::HashMap::new(),
@@ -1876,3 +1908,7 @@ mod tests_kill_descendants_option;
 #[cfg(test)]
 #[path = "../tests-rs/test_pane_instance.rs"]
 mod test_pane_instance;
+
+#[cfg(test)]
+#[path = "../tests-rs/test_issue450_heal_option.rs"]
+mod tests_issue450_heal_option;
