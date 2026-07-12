@@ -203,8 +203,8 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
     if let Some(dir) = start_dir {
         shell_cmd.cwd(std::path::Path::new(dir));
     }
-    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     apply_user_environment(&mut shell_cmd, &app.environment);
+    set_tmux_env(&mut shell_cmd, app.next_pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, app.claude_code_fix_tty, app.claude_code_force_interactive);
     let child = pair
         .slave
         .spawn_command(shell_cmd)
@@ -715,11 +715,25 @@ pub fn set_tmux_env(builder: &mut CommandBuilder, pane_id: usize, control_port: 
 
 }
 
+/// Env keys minted by psmux that user/session environment must never override.
+/// Matched case-insensitively (Windows env keys are case-insensitive).
+/// PSMUX_HOOKS_DISABLED is deliberately NOT protected (user kill-switch).
+pub const PROTECTED_ENV_KEYS: &[&str] = &[
+    "TMUX", "TMUX_PANE", "PSMUX_SESSION",
+    "PSMUX_SESSION_UID", "PSMUX_BUS_ID", "PSMUX_PANE_INSTANCE",
+];
+
+pub fn is_protected_env_key(key: &str) -> bool {
+    PROTECTED_ENV_KEYS.iter().any(|p| p.eq_ignore_ascii_case(key))
+}
+
 /// Apply user-defined environment variables (from set-environment -g) to a CommandBuilder.
 /// This ensures variables set via config or runtime `set-environment` are explicitly
 /// passed to every child pane, in addition to process inheritance.
+/// Protected keys (psmux-minted env vars) are skipped to ensure they are not overridden.
 pub fn apply_user_environment(builder: &mut CommandBuilder, environment: &std::collections::HashMap<String, String>) {
     for (key, value) in environment {
+        if is_protected_env_key(key) { continue; }
         builder.env(key, value);
     }
 }
@@ -1796,6 +1810,10 @@ mod test_parser_audible_bell {
         assert!(!bell_after_two_chunks(b"\x1b]0;title", b"\x07"));
     }
 }
+
+#[cfg(test)]
+#[path = "../tests-rs/test_env_protected.rs"]
+mod test_env_protected;
 
 // reap_children is in tree.rs
 
