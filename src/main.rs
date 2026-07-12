@@ -35,6 +35,7 @@ mod proxy_pane;
 mod cross_session;
 mod cross_session_server;
 mod events;
+mod hooks_install;
 
 use std::io::{self, Write, Read as _, BufRead as _, IsTerminal};
 use std::time::Duration;
@@ -3902,6 +3903,43 @@ fn run_main() -> io::Result<()> {
                         format!("notify-event '{}'\n", json), 2_000);
                 }
                 println!("{{}}");
+                return Ok(());
+            }
+            // hooks - Install/uninstall/status the Claude Code hook wiring in settings.json
+            "hooks" => {
+                let sub = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
+                let agent = cmd_args.get(2).map(|s| s.as_str()).unwrap_or("");
+                if agent != "claude" {
+                    eprintln!("psmux hooks: only 'claude' is supported in this version");
+                    std::process::exit(1);
+                }
+                let project_local = cmd_args.iter().any(|a| a.as_str() == "--project-local");
+                let settings = if project_local {
+                    std::path::PathBuf::from(".claude").join("settings.local.json")
+                } else {
+                    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+                    std::path::Path::new(&home).join(".claude").join("settings.json")
+                };
+                match sub {
+                    "install" => {
+                        let exe = std::env::current_exe()?;
+                        let r = hooks_install::install_claude(&settings, &exe)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        println!("claude hooks: {}{}",
+                            if r.changed { "installed" } else { "already installed" },
+                            r.backup.map(|b| format!(" (backup: {})", b.display())).unwrap_or_default());
+                    }
+                    "uninstall" => {
+                        let r = hooks_install::uninstall_claude(&settings)
+                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        println!("claude hooks: {}", if r.changed { "removed" } else { "nothing to remove" });
+                    }
+                    "status" | "doctor" => println!("{}", hooks_install::status_claude(&settings)),
+                    _ => {
+                        eprintln!("usage: psmux hooks <install|uninstall|status> claude [--project-local]");
+                        std::process::exit(1);
+                    }
+                }
                 return Ok(());
             }
             _ => {
