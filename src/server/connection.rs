@@ -1539,21 +1539,31 @@ match cmd {
             // loop: once RetireWarm teardown has begun the loop may never
             // dequeue this request, and a committed claimant interprets
             // silence as success (no cold-spawn fallback). The explicit ERR
-            // is what sends it down the cold-spawn path instead. The flag is
-            // checked immediately before the send; the residual window is a
-            // single instruction wide and is covered by the handler's final
-            // queue drain.
+            // is what sends it down the cold-spawn path instead. The
+            // flag-check + enqueue happen under WARM_CLAIM_GATE so a thread
+            // that saw "not retiring" has ALREADY enqueued by the time the
+            // RetireWarm handler (which sets the flag under the same gate)
+            // proceeds to its drain — descheduling cannot slip a claim past
+            // the teardown. The gate is dropped before the response wait.
             let client_cwd = non_flag.get(1).map(|s| s.to_string());
             let (rtx, rrx) = mpsc::channel::<String>();
-            if crate::types::WARM_RETIRING.load(std::sync::atomic::Ordering::SeqCst) {
-                let _ = write!(write_stream, "ERR: not a warm server (retiring)\n");
-                let _ = write_stream.flush();
-            } else {
-                let _ = tx.send(CtrlReq::ClaimSession(name.to_string(), client_cwd, rtx));
+            let enqueued = {
+                let _g = crate::types::WARM_CLAIM_GATE.lock().unwrap_or_else(|e| e.into_inner());
+                if crate::types::WARM_RETIRING.load(std::sync::atomic::Ordering::SeqCst) {
+                    false
+                } else {
+                    let _ = tx.send(CtrlReq::ClaimSession(name.to_string(), client_cwd, rtx));
+                    true
+                }
+            };
+            if enqueued {
                 if let Ok(resp) = rrx.recv_timeout(std::time::Duration::from_secs(5)) {
                     let _ = write!(write_stream, "{}", resp);
                     let _ = write_stream.flush();
                 }
+            } else {
+                let _ = write!(write_stream, "ERR: not a warm server (retiring)\n");
+                let _ = write_stream.flush();
             }
         }
     }

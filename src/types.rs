@@ -1638,6 +1638,17 @@ pub static CPR_DATA_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::
 /// back on a silent/slow response. Never cleared: retirement is one-way.
 pub static WARM_RETIRING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Gate that makes the WARM_RETIRING check-and-enqueue atomic. A bare flag
+/// load is not enough: a connection thread can load `false`, be descheduled
+/// for an unbounded time, and enqueue its ClaimSession after the retiring
+/// handler's final drain — silence, which a committed claimant treats as
+/// success. Claim threads hold this across flag-check + enqueue; the
+/// RetireWarm handler sets the flag while holding it. After the handler
+/// releases the gate, every pre-flag sender has provably already enqueued
+/// (one drain-to-empty catches them all) and every later thread sees the
+/// flag — no timing assumptions.
+pub static WARM_CLAIM_GATE: Mutex<()> = Mutex::new(());
+
 /// Issue #440: `pipe-pane` output routing.
 ///
 /// A pane's PTY reader thread tees every raw output chunk to any pipe writer

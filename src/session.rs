@@ -1106,19 +1106,16 @@ pub fn namespace_has_other_live_session(ns: Option<&str>, exclude_base: &str) ->
             continue;
         }
         let port_path = format!("{}\\{}.port", registry_dir(), base);
-        // An unreadable or malformed .port is NOT absence: fs::write is not
-        // atomic, so a reader can catch a session's registry entry mid-rewrite
-        // (registration, claim rename, 5s self-heal). Dropping it here could
-        // retire the warm standby while a real session lives. Uncertainty
-        // always counts as "present" — the cost of being wrong is only a warm
-        // server that outlives the namespace, never a broken real session.
-        // A file that vanished since the scan (NotFound) is genuine absence:
-        // that session tore down its own registry entry.
-        let port_str = match std::fs::read_to_string(&port_path) {
-            Ok(s) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return true,
-        };
+        // Any listed candidate that cannot be read cleanly counts as PRESENT.
+        // fs::write is not atomic, so a reader can catch an entry mid-rewrite
+        // (registration, self-heal); and NotFound after the listing is not
+        // necessarily teardown either — rename-session, a claim rename, or a
+        // concurrent CLI's startup cleanup can move/remove the file between
+        // list and read while the session lives on. Dropping any of these
+        // could retire the warm standby while a real session exists. The cost
+        // of being conservatively wrong is only a warm server that outlives
+        // the namespace, never a broken real session.
+        let Ok(port_str) = std::fs::read_to_string(&port_path) else { return true };
         let Ok(port) = port_str.trim().parse::<u16>() else { return true };
         let key = read_session_key(&base).unwrap_or_default();
         inputs.push((base, format!("127.0.0.1:{}", port), key));
