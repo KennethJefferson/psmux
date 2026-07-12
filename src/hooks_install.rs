@@ -120,7 +120,18 @@ pub fn status_claude(settings_path: &Path) -> String {
     }
 }
 
+/// Resolve the hooks manifest location.
+///
+/// Test/scripting override: when `PSMUX_HOOKS_MANIFEST_DIR` is set (non-empty),
+/// the manifest lives at `<that dir>\hooks-manifest.json` instead of the default
+/// `%USERPROFILE%\.psmux\hooks-manifest.json`. The unit tests set it so that
+/// `cargo test` never writes to the real per-user manifest.
 fn manifest_path() -> PathBuf {
+    if let Ok(dir) = std::env::var("PSMUX_HOOKS_MANIFEST_DIR") {
+        if !dir.trim().is_empty() {
+            return Path::new(&dir).join("hooks-manifest.json");
+        }
+    }
     let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
     Path::new(&home).join(".psmux").join("hooks-manifest.json")
 }
