@@ -5240,6 +5240,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 for cmd in cmds {
                     let _ = execute_command_string(&mut app, &cmd);
                 }
+                publish_hook_event(&mut app, event);
                 // Emit control mode notifications for hook events
                 if !app.control_clients.is_empty() {
                     let active_win = &app.windows[app.active_idx];
@@ -5701,7 +5702,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 Some(app.windows[app.active_idx].id)
             } else { None };
 
-            let (all_empty, any_pruned, any_newly_dead) = tree::reap_children(&mut app)?;
+            let (all_empty, any_pruned, any_newly_dead, pane_transitions) = tree::reap_children(&mut app)?;
             if any_pruned {
                 // A pane was removed from the tree - resize remaining panes to fill the space
                 resize_all_panes(&mut app);
@@ -5756,6 +5757,7 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                 meta_dirty = true;
                 crate::commands::fire_hooks(&mut app, "pane-died");
                 crate::commands::fire_hooks(&mut app, "pane-exited");
+                publish_pane_transitions(&mut app, &pane_transitions);
             }
             if app.exit_empty && all_empty {
                 warm_debug(&format!("EXIT_EMPTY firing for session '{}' (all panes empty/dead) -> removing port file + process::exit", app.session_name));
@@ -5790,6 +5792,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
     Ok(())
 }
 
+/// Map a committed hook_event tag to a bus event. Called from the hook_event
+/// consumer at the single post-command chokepoint.
+pub(crate) fn publish_hook_event(app: &mut AppState, event: &str) {
+    let (name, category, payload) = match event {
+        "after-new-window" => ("window-created", "window",
+            serde_json::json!({ "window_id": app.windows.get(app.active_idx).map(|w| w.id) })),
+        "after-rename-session" => ("session-renamed", "session",
+            serde_json::json!({ "name_len": app.session_name.len() })),
+        _ => return,
+    };
+    let _ = app.bus.publish(name, category, None, None, payload);
+}
+
+/// Publish a `pane-exited` event for each pane that left the live tree during
+/// the most recent reap pass, carrying its identity (pane id + instance) so
+/// subscribers can distinguish this pane from any future pane reusing the id.
+pub(crate) fn publish_pane_transitions(app: &mut AppState, transitions: &[crate::tree::PaneTransition]) {
+    for t in transitions {
+        let _ = app.bus.publish(
+            "pane-exited", "pane", Some(t.pane_id), Some(t.instance),
+            serde_json::json!({ "window_id": t.window_id, "reason": "exited" }),
+        );
+    }
+}
+
 #[cfg(test)]
 #[path = "../../tests-rs/test_server.rs"]
 mod tests;
@@ -5817,3 +5844,7 @@ mod test_issue167_startup_log;
 #[cfg(test)]
 #[path = "../../tests-rs/test_issue370_startup_error_passthrough.rs"]
 mod test_issue370_startup_error_passthrough;
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_agent_events_wiring.rs"]
+mod test_agent_events_wiring;
