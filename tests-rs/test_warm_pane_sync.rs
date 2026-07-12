@@ -133,6 +133,7 @@ fn resize_to_same_size_is_noop() {
         output_ring: std::sync::Arc::new(std::sync::Mutex::new(
             std::collections::VecDeque::new(),
         )),
+        minted_instance: None,
     });
 
     assert!(matches!(for_resize(&app, 40, 120), WarmPaneSync::Noop));

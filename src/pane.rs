@@ -161,9 +161,13 @@ pub fn create_window(pty_system: &dyn portable_pty::PtySystem, app: &mut AppStat
                 crate::warm_pane_sync::reconcile_consumed_parser(&mut parser, app);
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
-            // Warm-transplanted pane gets a fresh instance but NO identity env
-            // (it was spawned before the session was claimed) — see set_tmux_env.
-            let pane_instance = app.alloc_pane_instance();
+            // If this spare was spawned pre-claim (__warm__ pool; no identity
+            // env at all), mint a fresh instance now. If it was spawned by a
+            // live session replenishing its own pool, its env already has a
+            // baked-in instance (see spawn_warm_pane / WarmPane::minted_instance)
+            // that can never be changed post-spawn — reuse it verbatim so the
+            // tree stays in sync with what the live process actually reports.
+            let pane_instance = wp.minted_instance.unwrap_or_else(|| app.alloc_pane_instance());
             let configured_shell = if app.default_shell.is_empty() { None } else { Some(app.default_shell.as_str()) };
             let mut pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: wp.pane_id, instance: pane_instance, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
@@ -291,10 +295,25 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     let pane_id = app.next_pane_id;
     app.next_pane_id += 1;
     apply_user_environment(&mut shell_cmd, &app.environment);
-    // Warm pre-spawn happens before claim, so app.session_uid is empty here —
-    // no identity env is minted (set_tmux_env no-ops on empty session_uid).
-    // The pane gets a real instance only later, at transplant time.
-    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, 0, &app.session_uid, &app.bus_id_string(), app.claude_code_fix_tty, app.claude_code_force_interactive);
+    // A genuine pre-claim `__warm__` server has an empty session_uid here, so
+    // set_tmux_env no-ops the whole identity-env block and no instance is
+    // baked in (transplant mints one fresh once the session is real).
+    //
+    // BUT a live, already-claimed session also calls spawn_warm_pane to
+    // replenish its OWN pool (server startup's "early warm" pane, and the
+    // idle-loop/post-window replenish) — at those call sites app.session_uid
+    // is ALREADY minted. The instance must be allocated NOW and baked into
+    // this env, because it can never be changed after the child spawns:
+    // transplanting this pane later must reuse the SAME value, not allocate
+    // a second one, or the live process's real PSMUX_PANE_INSTANCE permanently
+    // disagrees with the tree's Pane.instance and every notify/hook-notify
+    // from that pane is rejected as stale (see WarmPane::minted_instance).
+    let minted_instance = if app.session_uid.is_empty() {
+        None
+    } else {
+        Some(app.alloc_pane_instance())
+    };
+    set_tmux_env(&mut shell_cmd, pane_id, app.control_port, app.socket_name.as_deref(), &app.session_name, minted_instance.unwrap_or(0), &app.session_uid, &app.bus_id_string(), app.claude_code_fix_tty, app.claude_code_force_interactive);
     let child = pair.slave
         .spawn_command(shell_cmd)
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("spawn shell error: {e}")))?;
@@ -321,7 +340,7 @@ pub fn spawn_warm_pane(pty_system: &dyn portable_pty::PtySystem, app: &mut AppSt
     let mut pty_writer = pair.master.take_writer()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("take writer error: {e}")))?;
     conpty_preemptive_dsr_response(&mut *pty_writer);
-    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, child_pid, pane_id, rows, cols, output_ring })
+    Ok(crate::types::WarmPane { master: pair.master, writer: pty_writer, child, term, data_version, cursor_shape, bell_pending, cpr_pending, child_pid, pane_id, rows, cols, output_ring, minted_instance })
 }
 
 pub fn split_active(app: &mut AppState, kind: LayoutKind) -> io::Result<()> {
@@ -485,9 +504,13 @@ pub fn split_active_with_command(app: &mut AppState, kind: LayoutKind, command: 
             }
             let epoch = std::time::Instant::now() - Duration::from_secs(2);
             let new_pane_id = wp.pane_id;
-            // Warm-transplanted pane gets a fresh instance but NO identity env
-            // (it was spawned before the session was claimed) — see set_tmux_env.
-            let pane_instance = app.alloc_pane_instance();
+            // If this spare was spawned pre-claim (__warm__ pool; no identity
+            // env at all), mint a fresh instance now. If it was spawned by a
+            // live session replenishing its own pool, its env already has a
+            // baked-in instance (see spawn_warm_pane / WarmPane::minted_instance)
+            // that can never be changed post-spawn — reuse it verbatim so the
+            // tree stays in sync with what the live process actually reports.
+            let pane_instance = wp.minted_instance.unwrap_or_else(|| app.alloc_pane_instance());
             let mut new_pane = Pane { master: wp.master, writer: wp.writer, child: wp.child, term: wp.term, last_rows: rows, last_cols: cols, id: new_pane_id, instance: pane_instance, title: hostname_cached(), title_locked: false, child_pid: wp.child_pid, data_version: wp.data_version, last_title_check: epoch, last_infer_title: epoch, dead: false, last_text_input: None, last_special_key: None, vt_bridge_cache: None, vti_mode_cache: None, mouse_input_cache: None, cursor_shape: wp.cursor_shape, bell_pending: wp.bell_pending, cpr_pending: wp.cpr_pending, copy_state: None, pane_style: None, squelch_until: None, output_ring: wp.output_ring };
             // Honour `-c <dir>`: silently re-home the transplanted warm shell.
             if let Some(dir) = start_dir {

@@ -185,6 +185,16 @@ pub struct WarmPane {
     pub rows: u16,
     pub cols: u16,
     pub output_ring: Arc<Mutex<VecDeque<u8>>>,
+    /// The pane_instance actually baked into this pane's live env at spawn
+    /// time (Some(n) whenever the owning server already had a minted
+    /// session_uid — i.e. a live session replenishing its own pool), or
+    /// None for a genuine pre-claim `__warm__` server spawn (no identity
+    /// env was set at all; see `set_tmux_env`). Transplant call sites MUST
+    /// reuse this value instead of calling `alloc_pane_instance()` again —
+    /// the child process's env can never be corrected post-spawn, so a
+    /// second allocation would desync the tree's `Pane.instance` from the
+    /// value the pane's own environment actually reports.
+    pub minted_instance: Option<u64>,
 }
 
 /// A pane extracted from this session for cross-session forwarding.
