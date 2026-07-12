@@ -18,9 +18,13 @@ use super::helpers::TMUX_COMMANDS;
 pub(crate) fn read_line_bounded<R: std::io::BufRead>(
     r: &mut R,
     cap: usize,
+    deadline: Option<std::time::Instant>,
 ) -> std::io::Result<Option<String>> {
     let mut buf: Vec<u8> = Vec::with_capacity(128);
     loop {
+        if let Some(d) = deadline {
+            if std::time::Instant::now() >= d { return Ok(None); }
+        }
         let mut byte = [0u8; 1];
         match r.read(&mut byte) {
             Ok(0) => break,
@@ -267,7 +271,7 @@ let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
 let mut r = io::BufReader::new(stream);
 
 // Read the authentication line with bounded read to prevent unbounded line attacks
-let auth_line = match read_line_bounded(&mut r, 1024) {
+let auth_line = match read_line_bounded(&mut r, 1024, Some(std::time::Instant::now() + std::time::Duration::from_secs(5))) {
     Ok(Some(l)) => l,
     _ => {
         let _ = write_stream.write_all(b"ERROR: Protocol violation\n");
