@@ -1340,6 +1340,11 @@ pub enum CtrlReq {
     /// Claim a warm server: rename session + send response so CLI knows it's done.
     /// Fields: session name, optional client CWD, response sender.
     ClaimSession(String, Option<String>, mpsc::Sender<String>),
+    /// Retire a dormant warm standby (sent by kill-session when it tears down
+    /// the namespace's last real session). Replies `OK` and shuts down only
+    /// while still genuinely warm; a server that has been claimed replies
+    /// `ERR: not warm` and stays up — retirement can never kill a real session.
+    RetireWarm(mpsc::Sender<String>),
     SwapPane(String),
     /// swap-pane -t <target>: swap the active pane with the pane identified by
     /// (target, pane_is_id).  When `pane_is_id` is true the value is a pane id

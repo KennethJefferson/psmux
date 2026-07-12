@@ -1484,8 +1484,7 @@ match cmd {
         // path is missing we ask our own server for its session name and
         // fall through to KillSession when raw_target matches us.
         if let Some(ref tgt) = raw_target {
-            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-            let port_path = format!("{}\\.psmux\\{}.port", home, tgt);
+            let port_path = format!("{}\\{}.port", crate::session::registry_dir(), tgt);
             let mut handled = false;
             if let Ok(port_str) = std::fs::read_to_string(&port_path) {
                 if let Ok(port) = port_str.trim().parse::<u16>() {
@@ -1516,6 +1515,14 @@ match cmd {
         let _ = tx.send(CtrlReq::HasSession(rtx));
         if let Ok(exists) = rrx.recv() {
             if !exists { std::process::exit(1); }
+        }
+    }
+    "retire-warm" => {
+        let (rtx, rrx) = mpsc::channel::<String>();
+        let _ = tx.send(CtrlReq::RetireWarm(rtx));
+        if let Ok(resp) = rrx.recv() {
+            let _ = write!(write_stream, "{}", resp);
+            let _ = write_stream.flush();
         }
     }
     "rename-session" | "rename" => {
@@ -2936,8 +2943,7 @@ match cmd {
 
             let port_file_base = name.clone();
 
-            let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-            let port_path = format!("{}\\.psmux\\{}.port", home, port_file_base);
+            let port_path = format!("{}\\{}.port", crate::session::registry_dir(), port_file_base);
 
             // Check if session already exists
             let already_exists = if std::path::Path::new(&port_path).exists() {

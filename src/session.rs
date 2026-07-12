@@ -28,17 +28,57 @@ pub fn is_warm_session(base: &str) -> bool {
     base == "__warm__" || base.ends_with("____warm__")
 }
 
+/// The session-registry directory: where `.port`/`.key`/`.sid`/`.pid`/
+/// `.claiming`/`.spawnlock` files plus `last_session` and `next_session_id`
+/// live. Default `%USERPROFILE%\.psmux`, overridable via `PSMUX_REGISTRY_DIR`
+/// so tests and scripts can sandbox a whole psmux world away from the user's
+/// real sessions. Diagnostics, config, and plugins deliberately stay on the
+/// home-derived paths — only session discovery/handshake state moves.
+///
+/// Resolved once per process (relative overrides bind to the initial CWD, so
+/// a claimed warm server that later changes CWD keeps the same registry), and
+/// the directory is created on first resolution so callers don't have to.
+/// Under `cfg(test)` an absent override defaults to a per-process temp sandbox
+/// which is exported to the environment so spawned children inherit it.
+pub fn registry_dir() -> &'static str {
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = match env::var("PSMUX_REGISTRY_DIR") {
+            Ok(v) if !v.trim().is_empty() => {
+                let p = std::path::PathBuf::from(v.trim());
+                if p.is_absolute() {
+                    p.to_string_lossy().into_owned()
+                } else {
+                    env::current_dir().map(|c| c.join(&p)).unwrap_or(p).to_string_lossy().into_owned()
+                }
+            }
+            _ => {
+                #[cfg(test)]
+                {
+                    let d = env::temp_dir().join(format!("psmux-cargo-test-{}", std::process::id()));
+                    let d = d.to_string_lossy().into_owned();
+                    env::set_var("PSMUX_REGISTRY_DIR", &d);
+                    d
+                }
+                #[cfg(not(test))]
+                {
+                    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+                    format!("{}\\.psmux", home)
+                }
+            }
+        };
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
 /// Find the next available numeric session name (tmux-compatible).
 /// tmux uses a monotonically incrementing counter, but since psmux has
 /// no persistent server state, we scan existing port files and pick
 /// the lowest non-negative integer not already in use.
 /// When `ns_prefix` is Some("foo"), names are checked as "foo__0", "foo__1", etc.
 pub fn next_session_name(ns_prefix: Option<&str>) -> String {
-    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
-        Ok(h) => h,
-        Err(_) => return "0".to_string(),
-    };
-    let psmux_dir = format!("{}\\.psmux", home);
+    let psmux_dir = crate::session::registry_dir().to_string();
     let mut used: std::collections::HashSet<u32> = std::collections::HashSet::new();
     if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
         for entry in entries.flatten() {
@@ -133,8 +173,7 @@ impl Drop for CounterLock {
 /// never observe the same `current` and return duplicate ids.
 pub fn allocate_session_id() -> usize {
     let _guard = SESSION_ID_ALLOC.lock().unwrap_or_else(|e| e.into_inner());
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let counter_path = format!("{}\\.psmux\\next_session_id", home);
+    let counter_path = format!("{}\\next_session_id", crate::session::registry_dir());
     let _xlock = CounterLock::acquire(format!("{}.lock", counter_path));
     let current = std::fs::read_to_string(&counter_path)
         .ok()
@@ -146,8 +185,7 @@ pub fn allocate_session_id() -> usize {
 
 /// Write a `.sid` file recording the session ID for this session.
 pub fn write_session_id_file(port_file_base: &str, session_id: usize) {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let sid_path = format!("{}\\.psmux\\{}.sid", home, port_file_base);
+    let sid_path = format!("{}\\{}.sid", crate::session::registry_dir(), port_file_base);
     let _ = std::fs::write(&sid_path, session_id.to_string());
 }
 
@@ -157,8 +195,7 @@ pub fn write_session_id_file(port_file_base: &str, session_id: usize) {
 /// calls this, so piggybacking `.pid` cleanup here keeps the registry consistent
 /// without touching each teardown call site.
 pub fn remove_session_id_file(port_file_base: &str) {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let sid_path = format!("{}\\.psmux\\{}.sid", home, port_file_base);
+    let sid_path = format!("{}\\{}.sid", crate::session::registry_dir(), port_file_base);
     let _ = std::fs::remove_file(&sid_path);
     remove_session_pid_file(port_file_base);
 }
@@ -169,23 +206,20 @@ pub fn remove_session_id_file(port_file_base: &str) {
 /// targeted by identity at all. The PID gives every registry entry a stable
 /// process anchor.
 pub fn write_session_pid_file(port_file_base: &str, pid: u32) {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let pid_path = format!("{}\\.psmux\\{}.pid", home, port_file_base);
+    let pid_path = format!("{}\\{}.pid", crate::session::registry_dir(), port_file_base);
     let _ = std::fs::write(&pid_path, pid.to_string());
 }
 
 /// Remove the `.pid` file for a session.
 pub fn remove_session_pid_file(port_file_base: &str) {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let pid_path = format!("{}\\.psmux\\{}.pid", home, port_file_base);
+    let pid_path = format!("{}\\{}.pid", crate::session::registry_dir(), port_file_base);
     let _ = std::fs::remove_file(&pid_path);
 }
 
 /// Resolve a tmux session ID (`$N`) to the port file base name of the
 /// session that owns that ID. Returns `None` if no session has that ID.
 pub fn resolve_session_by_id(id: usize) -> Option<String> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
-    let psmux_dir = format!("{}\\.psmux", home);
+    let psmux_dir = crate::session::registry_dir().to_string();
     if let Ok(entries) = std::fs::read_dir(&psmux_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
@@ -195,7 +229,7 @@ pub fn resolve_session_by_id(id: usize) -> Option<String> {
                         if file_id == id {
                             if let Some(base) = path.file_stem().and_then(|s| s.to_str()) {
                                 // Verify the session is actually alive
-                                let port_path = format!("{}\\.psmux\\{}.port", home, base);
+                                let port_path = format!("{}\\{}.port", crate::session::registry_dir(), base);
                                 if std::path::Path::new(&port_path).exists() {
                                     return Some(base.to_string());
                                 }
@@ -211,11 +245,7 @@ pub fn resolve_session_by_id(id: usize) -> Option<String> {
 
 /// Clean up any stale port files (where server is not actually running)
 pub fn cleanup_stale_port_files() {
-    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let psmux_dir = format!("{}\\.psmux", home);
+    let psmux_dir = crate::session::registry_dir().to_string();
     cleanup_stale_port_files_in(Path::new(&psmux_dir));
 }
 
@@ -321,11 +351,7 @@ fn read_tracked_registry(psmux_dir: &Path)
 /// server) and reaps the process itself, bounding the process count regardless
 /// of how the duplicate arose.
 pub fn reap_orphaned_servers() {
-    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let psmux_dir = format!("{}\\.psmux", home);
+    let psmux_dir = crate::session::registry_dir().to_string();
     reap_orphaned_servers_in(Path::new(&psmux_dir));
 }
 
@@ -680,8 +706,7 @@ fn probe_session_for_cleanup(key: &str, port: u16) -> PortProbeResult {
 
 /// Read the session key from the key file
 pub fn read_session_key(session: &str) -> io::Result<String> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
-    let keypath = format!("{}\\.psmux\\{}.key", home, session);
+    let keypath = format!("{}\\{}.key", crate::session::registry_dir(), session);
     std::fs::read_to_string(&keypath).map(|s| s.trim().to_string())
 }
 
@@ -1069,13 +1094,49 @@ pub fn classify_sessions_parallel(
     })
 }
 
+/// True when any real (non-warm) session other than `exclude_base` is present
+/// in namespace `ns`. Conservative by design: a session that answers (Alive)
+/// or whose identity can't be verified (Unreachable) counts as present; only a
+/// definitively Dead probe is treated as absent. Used by kill-session to
+/// decide whether it is tearing down the namespace's last real session.
+pub fn namespace_has_other_live_session(ns: Option<&str>, exclude_base: &str) -> bool {
+    let inputs: Vec<(String, String, String)> = list_session_names_ns(ns)
+        .into_iter()
+        .filter(|base| base != exclude_base)
+        .filter_map(|base| {
+            let port_path = format!("{}\\{}.port", registry_dir(), base);
+            let port: u16 = std::fs::read_to_string(&port_path).ok()?.trim().parse().ok()?;
+            let key = read_session_key(&base).unwrap_or_default();
+            Some((base, format!("127.0.0.1:{}", port), key))
+        })
+        .collect();
+    classify_sessions_parallel(inputs, Duration::from_millis(250), Duration::from_millis(500))
+        .into_iter()
+        .any(|(_, v)| !matches!(v, SessionLiveness::Dead))
+}
+
+/// Ask the namespace's warm standby (if any) to retire (exit cleanly).
+/// Best-effort: nothing to do when no warm entry resolves, and a warm server
+/// that was concurrently claimed refuses (`ERR: not warm`) and stays up as
+/// the real session it has become — this can never kill a real session.
+pub fn retire_warm_server(ns: Option<&str>) {
+    let warm_base = match ns {
+        Some(sn) => format!("{}____warm__", sn),
+        None => "__warm__".to_string(),
+    };
+    let port_path = format!("{}\\{}.port", registry_dir(), warm_base);
+    let Ok(port_str) = std::fs::read_to_string(&port_path) else { return };
+    let Ok(port) = port_str.trim().parse::<u16>() else { return };
+    let key = read_session_key(&warm_base).unwrap_or_default();
+    let _ = send_auth_cmd_response(&format!("127.0.0.1:{}", port), &key, b"retire-warm\n");
+}
+
 /// PID-anchor liveness for the session registered under `base`, for
 /// enumeration paths (e.g. CLI `list-sessions`) that would otherwise pay a
 /// TCP connect timeout per dead entry. Some(false) = definitively dead
 /// (reap + skip), Some(true) = live, None = no anchor (probe as usual).
 pub fn registry_pid_anchor_alive(base: &str) -> Option<bool> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
-    let port_path = format!("{}\\.psmux\\{}.port", home, base);
+    let port_path = format!("{}\\{}.port", crate::session::registry_dir(), base);
     pid_anchor_verdict(Path::new(&port_path))
 }
 
@@ -1084,16 +1145,11 @@ pub fn registry_pid_anchor_alive(base: &str) -> Option<bool> {
 /// Used when a probe proves the session is dead. Safe against a live server:
 /// it re-creates these files on its next 5s registry tick.
 pub fn remove_session_registry(base: &str) {
-    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
-        Ok(h) => h,
-        Err(_) => return,
-    };
-    let port_path = format!("{}\\.psmux\\{}.port", home, base);
+    let port_path = format!("{}\\{}.port", crate::session::registry_dir(), base);
     remove_session_registry_files(Path::new(&port_path));
 }
 
 pub fn send_control(line: String) -> io::Result<()> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     // Never target a warm (standby) session — resolve to a real session instead
     if is_warm_session(&target) {
@@ -1102,7 +1158,7 @@ pub fn send_control(line: String) -> io::Result<()> {
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
-    let path = format!("{}\\.psmux\\{}.port", home, target);
+    let path = format!("{}\\{}.port", crate::session::registry_dir(), target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
@@ -1138,7 +1194,6 @@ pub fn send_control(line: String) -> io::Result<()> {
 }
 
 pub fn send_control_with_response(line: String) -> io::Result<String> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     // Never target a warm (standby) session — resolve to a real session instead
     if is_warm_session(&target) {
@@ -1146,7 +1201,7 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
-    let path = format!("{}\\.psmux\\{}.port", home, target);
+    let path = format!("{}\\{}.port", crate::session::registry_dir(), target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     // Bounded connect: against a saturated listen backlog, a bare connect()
@@ -1208,7 +1263,6 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
 /// and the read timeout is `total_ms` (bounds the full round trip, matching
 /// the semantics `send_control_with_response` documents above).
 pub fn send_control_with_response_timeout(line: String, total_ms: u64) -> io::Result<String> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     // Never target a warm (standby) session — resolve to a real session instead
     if is_warm_session(&target) {
@@ -1216,7 +1270,7 @@ pub fn send_control_with_response_timeout(line: String, total_ms: u64) -> io::Re
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
-    let path = format!("{}\\.psmux\\{}.port", home, target);
+    let path = format!("{}\\{}.port", crate::session::registry_dir(), target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()
@@ -1303,14 +1357,13 @@ pub fn stream_control_lines(
     line: String,
     on_line: impl FnMut(&str) -> bool,
 ) -> io::Result<bool> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
     let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
     if is_warm_session(&target) {
         let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
         target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
     }
     let full_target = env::var("PSMUX_TARGET_FULL").ok();
-    let path = format!("{}\\.psmux\\{}.port", home, target);
+    let path = format!("{}\\{}.port", crate::session::registry_dir(), target);
     let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
     let session_key = read_session_key(&target).unwrap_or_default();
     let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()
@@ -1358,8 +1411,7 @@ pub fn resolve_last_session_name() -> Option<String> {
 /// and the returned name includes the prefix (e.g. "foo__dev").
 /// When `ns` is None, only non-namespaced sessions (no "__" in name) are considered.
 pub fn resolve_last_session_name_ns(ns: Option<&str>) -> Option<String> {
-    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
-    resolve_last_session_name_ns_in(std::path::Path::new(&format!("{}\\.psmux", home)), ns)
+    resolve_last_session_name_ns_in(std::path::Path::new(&crate::session::registry_dir().to_string()), ns)
 }
 
 /// Registry-directory-parameterized variant of [`resolve_last_session_name_ns`]:
@@ -1460,8 +1512,7 @@ fn session_base_owning_tmux_port(tmux_val: &str, psmux_dir: &std::path::Path) ->
 
 pub fn resolve_default_session_name() -> Option<String> {
     if let Ok(name) = env::var("PSMUX_DEFAULT_SESSION") {
-        let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
-        let p = format!("{}\\.psmux\\{}.port", home, name);
+        let p = format!("{}\\{}.port", crate::session::registry_dir(), name);
         if std::path::Path::new(&p).exists() { return Some(name); }
     }
     let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).ok()?;
@@ -1470,7 +1521,7 @@ pub fn resolve_default_session_name() -> Option<String> {
         if let Ok(text) = std::fs::read_to_string(cfg) {
             let line = text.lines().find(|l| !l.trim().is_empty())?;
             let name = if let Some(rest) = line.strip_prefix("default-session ") { rest.trim().to_string() } else { line.trim().to_string() };
-            let p = format!("{}\\.psmux\\{}.port", home, name);
+            let p = format!("{}\\{}.port", crate::session::registry_dir(), name);
             if std::path::Path::new(&p).exists() { return Some(name); }
         }
     }
@@ -1486,8 +1537,7 @@ pub fn list_session_names() -> Vec<String> {
 
 /// Return session names filtered by namespace (same logic as resolve_last_session_name_ns).
 pub fn list_session_names_ns(ns: Option<&str>) -> Vec<String> {
-    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-    let dir = format!("{}\\.psmux", home);
+    let dir = crate::session::registry_dir().to_string();
     let mut names = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for e in entries.flatten() {
@@ -1531,11 +1581,7 @@ pub struct TreeEntry {
 /// List all running sessions and their windows for choose-tree display.
 /// Queries each running server via its TCP port for window list info.
 pub fn list_all_sessions_tree(current_session: &str, current_windows: &[(String, usize, String, bool, usize)]) -> Vec<TreeEntry> {
-    let home = match env::var("USERPROFILE").or_else(|_| env::var("HOME")) {
-        Ok(h) => h,
-        Err(_) => return vec![],
-    };
-    let psmux_dir = format!("{}\\.psmux", home);
+    let psmux_dir = crate::session::registry_dir().to_string();
     let mut sessions: Vec<(String, u16, std::time::SystemTime)> = Vec::new();
 
     if let Ok(entries) = std::fs::read_dir(&psmux_dir) {

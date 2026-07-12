@@ -424,3 +424,64 @@ fn liveness_connected_but_silent_is_dead() {
     assert!(start.elapsed() < Duration::from_secs(2), "probe must stay bounded, not hang");
     drop(listener);
 }
+
+#[test]
+fn registry_dir_is_sandboxed_under_cargo_test() {
+    // The whole point of PSMUX_REGISTRY_DIR: `cargo test` must NEVER touch the
+    // user's real ~/.psmux registry (a killed test run used to claim/orphan the
+    // user's live warm server). Under cfg(test) the resolver defaults to a
+    // per-process temp sandbox and exports it so spawned children inherit it.
+    let dir = registry_dir();
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    let real = format!("{}\\.psmux", home);
+    assert!(!dir.eq_ignore_ascii_case(&real), "test registry must not be the real ~/.psmux");
+    assert!(std::path::Path::new(dir).is_dir(), "registry dir is created on first resolution");
+    let exported = std::env::var("PSMUX_REGISTRY_DIR").unwrap_or_default();
+    assert_eq!(exported, dir, "resolved dir is exported for child processes");
+}
+
+#[test]
+fn namespace_has_other_live_session_empty_registry_is_false() {
+    // Sandbox registry starts empty for this namespace: killing the last
+    // session in it must see "no other live session".
+    assert!(!namespace_has_other_live_session(Some("nsholstest_none"), "nsholstest_none__self"));
+}
+
+#[test]
+fn namespace_has_other_live_session_dead_entry_is_false_unverifiable_is_true() {
+    let ns = "nsholstest";
+    let dir = registry_dir();
+
+    // A .port pointing at a dead loopback port with a well-formed key file:
+    // probe classifies Dead -> not "present".
+    let dead_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dead_port = dead_listener.local_addr().unwrap().port();
+    drop(dead_listener); // port now refuses connections
+    let dead_base = format!("{}__deadone", ns);
+    std::fs::write(format!("{}\\{}.port", dir, dead_base), dead_port.to_string()).unwrap();
+    std::fs::write(format!("{}\\{}.key", dir, dead_base), "0123456789abcdef").unwrap();
+    assert!(
+        !namespace_has_other_live_session(Some(ns), &format!("{}__self", ns)),
+        "a definitively dead entry must not count as a live session"
+    );
+
+    // No .key at all: identity can't be verified -> Unreachable -> conservative
+    // "present" (kill-session must NOT retire the warm standby on uncertainty).
+    let unver_base = format!("{}__unverifiable", ns);
+    std::fs::write(format!("{}\\{}.port", dir, unver_base), dead_port.to_string()).unwrap();
+    assert!(
+        namespace_has_other_live_session(Some(ns), &format!("{}__self", ns)),
+        "an unverifiable entry must conservatively count as present"
+    );
+
+    // excluded base is ignored even when its files exist
+    let _ = std::fs::remove_file(format!("{}\\{}.port", dir, unver_base));
+    let self_base = format!("{}__self", ns);
+    std::fs::write(format!("{}\\{}.port", dir, self_base), dead_port.to_string()).unwrap();
+    assert!(!namespace_has_other_live_session(Some(ns), &self_base), "own base must be excluded");
+
+    for b in [&dead_base, &unver_base, &self_base] {
+        let _ = std::fs::remove_file(format!("{}\\{}.port", dir, b));
+        let _ = std::fs::remove_file(format!("{}\\{}.key", dir, b));
+    }
+}
