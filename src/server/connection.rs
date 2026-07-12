@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 use std::sync::mpsc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,6 +12,28 @@ use crate::control;
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 use crate::commands::parse_command_line;
 use super::helpers::TMUX_COMMANDS;
+
+/// Read one \n-terminated line with a byte cap. Ok(Some(line)) includes the newline;
+/// Ok(Some("")) is EOF; Ok(None) means the cap was exceeded before a newline (protocol violation).
+pub(crate) fn read_line_bounded<R: std::io::BufRead>(
+    r: &mut R,
+    cap: usize,
+) -> std::io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(128);
+    loop {
+        let mut byte = [0u8; 1];
+        match r.read(&mut byte) {
+            Ok(0) => break,
+            Ok(_) => {
+                buf.push(byte[0]);
+                if byte[0] == b'\n' { break; }
+                if buf.len() > cap { return Ok(None); }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+}
 
 /// Split a command line on top-level `;` separators, respecting single and
 /// double quotes and `\` escapes. Real tmux's parser treats `;` as a command
@@ -244,11 +266,14 @@ let mut write_stream = match stream.try_clone() {
 let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
 let mut r = io::BufReader::new(stream);
 
-// Read the authentication line
-let mut auth_line = String::new();
-if r.read_line(&mut auth_line).is_err() {
-    return;
-}
+// Read the authentication line with bounded read to prevent unbounded line attacks
+let auth_line = match read_line_bounded(&mut r, 1024) {
+    Ok(Some(l)) => l,
+    _ => {
+        let _ = write_stream.write_all(b"ERROR: Protocol violation\n");
+        return;
+    }
+};
 
 // Verify session key
 let auth_line = auth_line.trim();
@@ -3984,3 +4009,7 @@ fn dispatch_control_command(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests-rs/test_bounded_read.rs"]
+mod test_bounded_read;
