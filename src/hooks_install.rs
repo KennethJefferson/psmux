@@ -32,15 +32,26 @@ fn load(path: &Path) -> Result<serde_json::Value, String> {
 }
 
 /// Lock via exclusive sibling lockfile; retry ~2s then fail.
+/// The lock is taken before any write, so the settings parent dir (e.g. a fresh
+/// project's `.claude\`) may not exist yet — create it here, and only retry on
+/// AlreadyExists (real contention); any other error is terminal.
 fn acquire_lock(path: &Path) -> Result<PathBuf, String> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("could not create {}: {}", dir.display(), e))?;
+    }
     let lock = path.with_extension("json.psmux-lock");
+    let mut last_err = String::new();
     for _ in 0..40 {
         match std::fs::OpenOptions::new().write(true).create_new(true).open(&lock) {
             Ok(_) => return Ok(lock),
-            Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                last_err = e.to_string();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => return Err(format!("could not lock {}: {}", lock.display(), e)),
         }
     }
-    Err(format!("could not lock {}", lock.display()))
+    Err(format!("could not lock {}: {}", lock.display(), last_err))
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {

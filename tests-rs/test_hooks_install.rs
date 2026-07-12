@@ -56,6 +56,20 @@ fn install_into_missing_file_creates_stop_hook() {
 }
 
 #[test]
+fn install_into_missing_parent_dir_creates_it() {
+    // --project-local in a fresh project: .claude\ does not exist yet. The lock
+    // file is acquired before any write, so install must create the parent dir
+    // itself rather than failing with a misleading "could not lock" error.
+    let p = tmp("freshdir");
+    let p = p.parent().unwrap().join(".claude").join("settings.local.json");
+    assert!(!p.parent().unwrap().exists());
+    let r = install_claude(&p, std::path::Path::new("C:\\bin\\psmux.exe")).unwrap();
+    assert!(r.changed);
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    assert!(v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap().contains("hook-notify claude stop"));
+}
+
+#[test]
 fn install_preserves_foreign_hooks_and_is_idempotent() {
     let p = tmp("foreign");
     std::fs::write(&p, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"my-own-thing"}]}]},"model":"opus"}"#).unwrap();
