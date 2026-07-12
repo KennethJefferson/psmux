@@ -1519,6 +1519,18 @@ fn run_main() -> io::Result<()> {
                 let mut i = 1;
                 while i < cmd_args.len() {
                     match cmd_args[i].as_str() {
+                        "--settle" => {
+                            if let Some(v) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -W {}", v));
+                                i += 1;
+                            }
+                        }
+                        "--settle-timeout" => {
+                            if let Some(v) = cmd_args.get(i + 1) {
+                                cmd.push_str(&format!(" -Y {}", v));
+                                i += 1;
+                            }
+                        }
                         "-t" => {
                             if let Some(target) = cmd_args.get(i + 1) {
                                 cmd.push_str(&format!(" -t {}", target));
@@ -1587,6 +1599,10 @@ fn run_main() -> io::Result<()> {
                 cmd.push('\n');
                 if print_stdout {
                     let resp = send_control_with_response(cmd)?;
+                    if let Some(rest) = resp.strip_prefix("SETTLE-TIMEOUT\n") {
+                        print!("{}", rest);
+                        std::process::exit(1);
+                    }
                     print!("{}", resp);
                 } else {
                     send_control(cmd)?;
@@ -3749,6 +3765,138 @@ fn run_main() -> io::Result<()> {
                 send_control("unlink-window\n".to_string())?;
                 return Ok(());
             }
+            // cursor - Print the current event-bus cursor (session:bus:seq)
+            "cursor" => {
+                let resp = send_control_with_response("events-cursor\n".to_string())?;
+                let out = resp.trim();
+                println!("{}", out);
+                if out.starts_with("ERR") {
+                    return Err(io::Error::new(io::ErrorKind::Other, "bus dormant"));
+                }
+                return Ok(());
+            }
+            // wait-event - Block until a matching event, or a bus outcome (timeout/gap/mismatch/ended)
+            "wait-event" => {
+                let mut pane: Option<u64> = None;
+                let mut inst: Option<u64> = None;
+                let mut name: Option<String> = None;
+                let mut after: Option<String> = None;
+                let mut timeout: u64 = 60_000;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "--pane" => { i += 1; pane = cmd_args.get(i).and_then(|s| s.trim_start_matches('%').parse().ok()); }
+                        "--instance" => { i += 1; inst = cmd_args.get(i).and_then(|s| s.parse().ok()); }
+                        "--name" => { i += 1; name = cmd_args.get(i).map(|s| s.to_string()); }
+                        "--after" => { i += 1; after = cmd_args.get(i).map(|s| s.to_string()); }
+                        "--timeout" => { i += 1; timeout = cmd_args.get(i).and_then(|s| s.parse().ok()).unwrap_or(60_000); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                // AMENDMENT 1: never send a present-but-null "after" — the server
+                // treats that as a bad cursor. Only insert keys that have a value.
+                let mut req = serde_json::Map::new();
+                if let Some(p) = pane { req.insert("pane_id".to_string(), serde_json::json!(p)); }
+                if let Some(g) = inst { req.insert("pane_instance".to_string(), serde_json::json!(g)); }
+                if let Some(ref n) = name { req.insert("name".to_string(), serde_json::json!(n)); }
+                if let Some(ref a) = after { req.insert("after".to_string(), serde_json::json!(a)); }
+                req.insert("timeout_ms".to_string(), serde_json::json!(timeout));
+                let json = serde_json::Value::Object(req).to_string();
+                // AMENDMENT 2: the wire tokenizer strips unescaped double quotes but
+                // treats single-quoted spans as literal, so wrap the JSON arg in
+                // single quotes; escape any embedded single quote as the JSON-legal
+                // ' so it can't prematurely close the quoted span.
+                let json = json.replace('\'', "\\u0027");
+                let resp = session::send_control_with_response_timeout(
+                    format!("wait-event '{}'\n", json), timeout + 10_000)?;
+                let reply = resp.trim();
+                println!("{}", reply);
+                std::process::exit(wait_event_exit_code(reply));
+            }
+            // events - Stream events as JSON lines until a terminal frame
+            "events" => {
+                let mut wire = String::from("events-subscribe");
+                let mut show_heartbeat = true;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "--name" => { i += 1; if let Some(v) = cmd_args.get(i) { wire.push_str(&format!(" name={}", v)); } }
+                        "--category" => { i += 1; if let Some(v) = cmd_args.get(i) { wire.push_str(&format!(" category={}", v)); } }
+                        "--after" => { i += 1; if let Some(v) = cmd_args.get(i) { wire.push_str(&format!(" after={}", v)); } }
+                        "--no-heartbeat" => { show_heartbeat = false; }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                wire.push('\n');
+                session::stream_control_lines(wire, |line| {
+                    if !show_heartbeat && line.contains("\"type\":\"heartbeat\"") { return true; }
+                    println!("{}", line);
+                    !line.contains("\"type\":\"closed\"")
+                })?;
+                return Ok(());
+            }
+            // notify - Publish an agent event from inside a pane (silent no-op outside psmux)
+            "notify" => {
+                let mut name = "agent-notify".to_string();
+                let mut title = String::new();
+                let mut content: Option<String> = None;
+                let mut include_content = false;
+                let mut i = 1;
+                while i < cmd_args.len() {
+                    match cmd_args[i].as_str() {
+                        "--done" => name = "agent-done".to_string(),
+                        "--name" => { i += 1; if let Some(v) = cmd_args.get(i) { name = v.to_string(); } }
+                        "--title" => { i += 1; if let Some(v) = cmd_args.get(i) { title = v.to_string(); } }
+                        "--include-content" => include_content = true,
+                        "--content" => { i += 1; content = cmd_args.get(i).map(|s| s.to_string()); }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                let env = NotifyEnv::from_process_env();
+                if env.pane_instance.is_none() || env.session_uid.is_empty() {
+                    // Outside psmux (or a warm/pre-spawned pane): silent no-op success.
+                    return Ok(());
+                }
+                // Truncate by char count, not byte index, to avoid slicing on a
+                // UTF-8 boundary (the server re-truncates to 4096 chars anyway;
+                // this just avoids sending more than necessary over the wire).
+                let truncated: Option<String> = if include_content {
+                    content.as_deref().map(|s| s.chars().take(4096).collect())
+                } else {
+                    None
+                };
+                let c = truncated.as_deref();
+                let json = build_notify_json(&env, &name, title.len(), c);
+                let json = json.replace('\'', "\\u0027");
+                // Bounded-sync: 2000 ms total; failures are swallowed (always exit 0).
+                let _ = session::send_control_with_response_timeout(
+                    format!("notify-event '{}'\n", json), 2_000);
+                return Ok(());
+            }
+            // hook-notify - Agent hook entrypoint (reads stdin, always prints "{}", always exits 0)
+            "hook-notify" => {
+                let agent = cmd_args.get(1).map(|s| s.to_string()).unwrap_or_default();
+                let event = cmd_args.get(2).map(|s| s.to_string()).unwrap_or_default();
+                // Always satisfy the agent hook contract no matter what happens below.
+                let mut stdin_buf = String::new();
+                {
+                    let _ = std::io::stdin().take(1024 * 1024).read_to_string(&mut stdin_buf);
+                }
+                let env = NotifyEnv::from_process_env();
+                let disabled = std::env::var("PSMUX_HOOKS_DISABLED").ok().as_deref() == Some("1");
+                if !disabled && env.pane_instance.is_some() && !env.session_uid.is_empty() {
+                    let name = parse_hook_event_name(&agent, &event);
+                    let json = build_notify_json(&env, name, 0, None);
+                    let json = json.replace('\'', "\\u0027");
+                    let _ = session::send_control_with_response_timeout(
+                        format!("notify-event '{}'\n", json), 2_000);
+                }
+                println!("{{}}");
+                return Ok(());
+            }
             _ => {
                 // Unknown command - print error and exit
                 if !cmd.is_empty() {
@@ -4494,6 +4642,66 @@ fn detached_list_windows_ready(resp: &str) -> bool {
     let t = resp.trim();
     !t.is_empty() && !t.starts_with("ERROR:")
 }
+
+/// Environment identifying the calling pane/session for `notify`/`hook-notify`.
+/// Populated from process env vars set by the server into every pane
+/// (see `src/pane.rs`): TMUX_PANE, PSMUX_PANE_INSTANCE, PSMUX_SESSION_UID.
+pub(crate) struct NotifyEnv {
+    pub pane_id: Option<usize>,
+    pub pane_instance: Option<u64>,
+    pub session_uid: String,
+}
+
+impl NotifyEnv {
+    pub(crate) fn from_process_env() -> NotifyEnv {
+        NotifyEnv {
+            pane_id: std::env::var("TMUX_PANE").ok()
+                .and_then(|s| s.trim_start_matches('%').parse::<usize>().ok()),
+            pane_instance: std::env::var("PSMUX_PANE_INSTANCE").ok()
+                .and_then(|s| s.parse::<u64>().ok()),
+            session_uid: std::env::var("PSMUX_SESSION_UID").unwrap_or_default(),
+        }
+    }
+}
+
+/// Build the JSON payload for `notify-event`/hook-notify. Only ever emits the
+/// fields the server's `notify-event` wire arm reads (pane_id, pane_instance,
+/// session_uid, name, title_len, content) — deliberately does NOT include an
+/// "after" key (that belongs to the wait-event request, see AMENDMENT 1: the
+/// server treats a present-but-null `after` as a bad cursor).
+pub(crate) fn build_notify_json(env: &NotifyEnv, name: &str, title_len: usize, content: Option<&str>) -> String {
+    serde_json::json!({
+        "pane_id": env.pane_id,
+        "pane_instance": env.pane_instance,
+        "session_uid": env.session_uid,
+        "name": name,
+        "title_len": title_len,
+        "content": content,
+    }).to_string()
+}
+
+/// Map a `wait-event` wire reply to a CLI exit code.
+pub(crate) fn wait_event_exit_code(reply: &str) -> i32 {
+    let r = reply.trim();
+    if r.starts_with('{') { 0 }
+    else if r == "TIMEOUT" { 2 }
+    else if r == "GAP" { 3 }
+    else if r == "MISMATCH" { 4 }
+    else if r == "ENDED" { 5 }
+    else { 1 }
+}
+
+/// Map an agent hook's (agent, event) pair to a psmux event bus name.
+pub(crate) fn parse_hook_event_name(_agent: &str, event: &str) -> &'static str {
+    match event {
+        "stop" | "agent-turn-complete" => "agent-done",
+        _ => "agent-notify",
+    }
+}
+
+#[cfg(test)]
+#[path = "../tests-rs/test_cli_events_args.rs"]
+mod test_cli_events_args;
 
 #[cfg(test)]
 mod readiness_tests {

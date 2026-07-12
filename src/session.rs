@@ -1198,6 +1198,123 @@ pub fn send_control_with_response(line: String) -> io::Result<String> {
     Ok(result)
 }
 
+/// Same as [`send_control_with_response`] but with caller-supplied connect and
+/// read timeouts, so long-lived requests like `wait-event` can be given a
+/// read deadline that comfortably exceeds the requested wait, while short
+/// requests (e.g. `notify`) can still be tightly bounded (2s).
+///
+/// `total_ms` drives both timeouts: the connect timeout is `min(1000, total_ms)`
+/// (a slow/saturated listener shouldn't be allowed to eat the whole budget),
+/// and the read timeout is `total_ms` (bounds the full round trip, matching
+/// the semantics `send_control_with_response` documents above).
+pub fn send_control_with_response_timeout(line: String, total_ms: u64) -> io::Result<String> {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    // Never target a warm (standby) session — resolve to a real session instead
+    if is_warm_session(&target) {
+        let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
+        target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
+    }
+    let full_target = env::var("PSMUX_TARGET_FULL").ok();
+    let path = format!("{}\\.psmux\\{}.port", home, target);
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
+    let session_key = read_session_key(&target).unwrap_or_default();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "bad server address"))?;
+    let connect_ms = total_ms.min(1000);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(connect_ms))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(total_ms)));
+    let _ = write!(stream, "AUTH {}\n", session_key);
+    if let Some(ref ft) = full_target {
+        let _ = write!(stream, "TARGET {}\n", ft);
+    }
+    let _ = write!(stream, "{}", line);
+    let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
+    let mut buf = Vec::new();
+    let mut temp = [0u8; 4096];
+    let mut timed_out = false;
+    loop {
+        match std::io::Read::read(&mut stream, &mut temp) {
+            Ok(0) => break,
+            Ok(n) => buf.extend_from_slice(&temp[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => { timed_out = true; break; }
+            Err(_) => break,
+        }
+    }
+    if timed_out && buf.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "no response from server (timed out)"));
+    }
+    let result = String::from_utf8_lossy(&buf).to_string();
+    let result = if result.starts_with("OK\n") {
+        result[3..].to_string()
+    } else if result.starts_with("OK\r\n") {
+        result[4..].to_string()
+    } else {
+        result
+    };
+    Ok(result)
+}
+
+/// Line-streaming variant used by `events`: sends the same AUTH/TARGET/command
+/// preamble as [`send_control_with_response`], but does NOT half-close the
+/// write side and does NOT read to EOF — instead reads line by line (the
+/// server keeps this connection open, pushing one JSON event/heartbeat per
+/// line) and invokes `on_line` for each line after the initial "OK" ack line
+/// is skipped. Stops when `on_line` returns false or the connection ends.
+pub fn stream_control_lines(
+    line: String,
+    mut on_line: impl FnMut(&str) -> bool,
+) -> io::Result<()> {
+    let home = env::var("USERPROFILE").or_else(|_| env::var("HOME")).unwrap_or_default();
+    let mut target = env::var("PSMUX_TARGET_SESSION").ok().unwrap_or_else(|| "default".to_string());
+    if is_warm_session(&target) {
+        let ns = target.strip_suffix("____warm__").map(|s| s.to_string());
+        target = resolve_last_session_name_ns(ns.as_deref()).unwrap_or_else(|| "default".to_string());
+    }
+    let full_target = env::var("PSMUX_TARGET_FULL").ok();
+    let path = format!("{}\\.psmux\\{}.port", home, target);
+    let port = std::fs::read_to_string(&path).ok().and_then(|s| s.trim().parse::<u16>().ok()).ok_or_else(|| io::Error::new(io::ErrorKind::Other, format!("no server running on session '{}'", target)))?.clone();
+    let session_key = read_session_key(&target).unwrap_or_default();
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "bad server address"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(1000))?;
+    let _ = stream.set_nodelay(true);
+    // Long read timeout: the server sends a heartbeat at least every
+    // HEARTBEAT_SECS, so any gap longer than that plus slack means the
+    // connection is dead.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(crate::events::HEARTBEAT_SECS + 10)));
+    let _ = write!(stream, "AUTH {}\n", session_key);
+    if let Some(ref ft) = full_target {
+        let _ = write!(stream, "TARGET {}\n", ft);
+    }
+    let _ = write!(stream, "{}", line);
+    let _ = stream.flush();
+    let mut reader = io::BufReader::new(stream);
+    let mut buf = String::new();
+    // Skip 2 preamble lines before any real event: the connection-level AUTH
+    // "OK" ack, then the events-subscribe ack (the initial cursor/ack json).
+    let mut lines_to_skip = 2;
+    loop {
+        buf.clear();
+        match std::io::BufRead::read_line(&mut reader, &mut buf) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let text = buf.trim_end_matches(['\r', '\n']);
+                if lines_to_skip > 0 {
+                    lines_to_skip -= 1;
+                    continue;
+                }
+                if !on_line(text) { break; }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => break,
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
 /// Send a control message to a specific port with authentication
 pub fn send_control_to_port(port: u16, msg: &str, session_key: &str) -> io::Result<()> {
     let addr = format!("127.0.0.1:{}", port);
