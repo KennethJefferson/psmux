@@ -25,9 +25,12 @@ $pass = 0; $fail = 0
 function P($m){ Write-Host "[PASS] $m" -ForegroundColor Green; $script:pass++ }
 function F($m){ Write-Host "[FAIL] $m" -ForegroundColor Red; $script:fail++ }
 
-function Warm-Count {
+# Count warm-launched processes born AFTER $since. Strays from earlier runs
+# both inflate a plain baseline and can be reaped mid-test by other CLIs'
+# orphan reapers, so creation-time filtering is the only stable measure.
+function Warm-Born-Since([datetime]$since) {
   @(Get-CimInstance Win32_Process -Filter "Name='psmux.exe'" -EA SilentlyContinue |
-    Where-Object { $_.CommandLine -match '-s __warm__' }).Count
+    Where-Object { $_.CommandLine -match '-s __warm__' -and $_.CreationDate -gt $since }).Count
 }
 
 # Send one authenticated command over raw TCP and return everything the
@@ -51,7 +54,7 @@ function Send-AuthedCommand([int]$port, [string]$key, [string]$cmd) {
 
 $realReg = "$env:USERPROFILE\.psmux"
 $realBefore = @(Get-ChildItem $realReg -File -EA SilentlyContinue | ForEach-Object Name) | Sort-Object
-$warmBaseline = Warm-Count
+$testStart = Get-Date
 
 # --- 1. two sessions; registry state must land in the sandbox
 & $P new-session -d -s rsb_a -x 100 -y 30
@@ -88,9 +91,9 @@ else { F "warm standby retired too early (rsb_b still alive)" }
 Start-Sleep -m 2500
 if (-not (Test-Path "$REG\__warm__.port")) { P "warm registry entry removed after last kill-session" }
 else { F "__warm__.port still present after last kill-session" }
-$warmDelta = (Warm-Count) - $warmBaseline
-if ($warmDelta -eq 0) { P "warm server process count returned to baseline (delta 0)" }
-else { F "warm process leak: delta $warmDelta after last kill-session" }
+$leftover = Warm-Born-Since $testStart
+if ($leftover -eq 0) { P "no warm processes born during the test remain" }
+else { F "warm process leak: $leftover test-born warm server(s) alive after last kill-session" }
 
 # --- 1b. real ~/.psmux must be byte-identical in membership
 $realAfter = @(Get-ChildItem $realReg -File -EA SilentlyContinue | ForEach-Object Name) | Sort-Object

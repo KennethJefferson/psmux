@@ -1116,16 +1116,33 @@ pub fn namespace_has_other_live_session(ns: Option<&str>, exclude_base: &str) ->
 }
 
 /// Ask the namespace's warm standby (if any) to retire (exit cleanly).
-/// Best-effort: nothing to do when no warm entry resolves, and a warm server
-/// that was concurrently claimed refuses (`ERR: not warm`) and stays up as
-/// the real session it has become — this can never kill a real session.
+///
+/// Mutual exclusion with claims: a claiming `new-session` COMMITS by winning
+/// an atomic rename of `__warm__.port` (a slow claim response deliberately
+/// does not fall back to a cold spawn — see the claim path in main.rs), so a
+/// retire that merely read the port file could kill the warm AFTER a claimant
+/// committed, stranding it. Retirement therefore competes in the same rename
+/// protocol: it only proceeds if IT wins the `.port` rename. Losing the
+/// rename means a claimant owns the warm — nothing to retire. Winning it
+/// also removes the pointer, so a later `new-session` cold-spawns instead of
+/// chasing a dying server.
+///
+/// Best-effort past that point: a dead port or a server that was somehow
+/// claimed anyway refuses (`ERR: not warm`) and stays up — this can never
+/// kill a real session.
 pub fn retire_warm_server(ns: Option<&str>) {
     let warm_base = match ns {
         Some(sn) => format!("{}____warm__", sn),
         None => "__warm__".to_string(),
     };
     let port_path = format!("{}\\{}.port", registry_dir(), warm_base);
-    let Ok(port_str) = std::fs::read_to_string(&port_path) else { return };
+    let handoff = format!("{}.psmux-retiring", port_path);
+    let _ = std::fs::remove_file(&handoff); // stale handoff from a crashed retirer
+    if std::fs::rename(&port_path, &handoff).is_err() {
+        return; // no warm entry, or a claimant already won the rename
+    }
+    let port_str = std::fs::read_to_string(&handoff).unwrap_or_default();
+    let _ = std::fs::remove_file(&handoff);
     let Ok(port) = port_str.trim().parse::<u16>() else { return };
     let key = read_session_key(&warm_base).unwrap_or_default();
     let _ = send_auth_cmd_response(&format!("127.0.0.1:{}", port), &key, b"retire-warm\n");

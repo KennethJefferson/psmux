@@ -2979,9 +2979,31 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if app.is_warm_server() {
                         warm_debug(&format!("RETIRE ACCEPT: __warm__ (port={:?})", app.control_port));
                         let _ = resp.send("OK\n".to_string());
-                        // Give the connection thread a beat to flush the reply
-                        // before process exit (mirrors KillSession's DETACH sleep).
-                        std::thread::sleep(Duration::from_millis(50));
+                        // Drain the control channel before exiting. The 5s
+                        // registry self-heal (same thread — it cannot run past
+                        // this point) may have resurrected __warm__.port after
+                        // the retirer consumed it, letting a new-session claim
+                        // this dying server and COMMIT (a committed claimant
+                        // deliberately does not cold-spawn on a slow response).
+                        // Such a claim must get an explicit "ERR" — that is the
+                        // one reply that makes the claimant fall back to a cold
+                        // spawn; silence strands it waiting for a session that
+                        // will never appear. The drain window also flushes our
+                        // own OK through the connection thread.
+                        let drain_deadline = std::time::Instant::now() + Duration::from_millis(500);
+                        if let Some(rx) = app.control_rx.as_ref() {
+                            while std::time::Instant::now() < drain_deadline {
+                                match rx.recv_timeout(Duration::from_millis(50)) {
+                                    Ok(CtrlReq::ClaimSession(name, _, cresp)) => {
+                                        warm_debug(&format!("CLAIM REFUSED while retiring: requested name='{}'", name));
+                                        let _ = cresp.send("ERR: not a warm server (retiring)\n".to_string());
+                                    }
+                                    Ok(CtrlReq::RetireWarm(r2)) => { let _ = r2.send("OK\n".to_string()); }
+                                    Ok(_) => {}
+                                    Err(_) => {}
+                                }
+                            }
+                        }
                         tree::kill_all_children_batch(&mut app.windows);
                         if let Some(mut wp) = app.warm_pane.take() { wp.child.kill().ok(); }
                         std::thread::sleep(std::time::Duration::from_millis(10));

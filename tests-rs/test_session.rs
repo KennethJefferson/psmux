@@ -465,20 +465,53 @@ fn retire_warm_server_swallows_garbage_and_dead_entries() {
     let port_path = format!("{}\\{}.port", dir, warm_base);
     let key_path = format!("{}\\{}.key", dir, warm_base);
 
-    // Garbage port file: parse fails -> silent no-op.
+    // Garbage port file: parse fails -> silent no-op, but the retire WON the
+    // rename, so the (useless) pointer is consumed.
     std::fs::write(&port_path, "not-a-port").unwrap();
     retire_warm_server(Some("rwtest_dead"));
+    assert!(!std::path::Path::new(&port_path).exists(), "won rename must consume the pointer");
 
-    // Well-formed entry pointing at a dead port: connect fails -> swallowed.
+    // Well-formed entry pointing at a dead port: connect fails -> swallowed,
+    // pointer likewise consumed (a dead warm entry must not linger).
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let dead_port = l.local_addr().unwrap().port();
     drop(l);
     std::fs::write(&port_path, dead_port.to_string()).unwrap();
     std::fs::write(&key_path, "0123456789abcdef").unwrap();
     retire_warm_server(Some("rwtest_dead"));
+    assert!(!std::path::Path::new(&port_path).exists(), "dead warm pointer must be consumed");
 
     let _ = std::fs::remove_file(&port_path);
     let _ = std::fs::remove_file(&key_path);
+}
+
+#[test]
+fn retire_warm_server_loses_the_rename_to_a_claimant() {
+    // Claim-vs-retire mutual exclusion: the claim path commits by atomically
+    // renaming `__warm__.port` away. Once that rename happened, a concurrent
+    // retire must find nothing to rename and walk away — it must NOT contact
+    // (and kill) the warm server the claimant now owns.
+    let dir = registry_dir();
+    let warm_base = "rwtest_claimed____warm__";
+    let port_path = format!("{}\\{}.port", dir, warm_base);
+
+    // A live listener stands in for the warm server mid-claim: if retire
+    // (incorrectly) contacted it, the connect would succeed. The pointer
+    // has already been renamed away by the "claimant".
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let live_port = l.local_addr().unwrap().port();
+    let claimed_path = format!("{}\\{}.port.claiming", dir, warm_base);
+    std::fs::write(&claimed_path, live_port.to_string()).unwrap(); // claimant's handoff
+    assert!(!std::path::Path::new(&port_path).exists());
+
+    retire_warm_server(Some("rwtest_claimed"));
+
+    // Nothing connected to the listener (no pending accept) and the
+    // claimant's handoff file is untouched.
+    l.set_nonblocking(true).unwrap();
+    assert!(l.accept().is_err(), "retire must not contact a warm owned by a claimant");
+    assert!(std::path::Path::new(&claimed_path).exists(), "claimant handoff must be untouched");
+    let _ = std::fs::remove_file(&claimed_path);
 }
 
 #[test]
