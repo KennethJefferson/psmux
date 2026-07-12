@@ -1274,8 +1274,12 @@ pub enum CtrlReq {
     },
     KillPane,
     KillPaneById(usize),
-    CapturePane(mpsc::Sender<String>),
-    CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>),
+    /// Capture a pane's screen text. The trailing `Option<usize>` is the pane
+    /// id when the caller's `-t %N` named one: the capture is PINNED to that
+    /// pane, immune to the temp-focus restore being consumed by concurrent
+    /// requests (the settle wrong-pane leak). `None` = active pane.
+    CapturePane(mpsc::Sender<String>, Option<usize>),
+    CapturePaneStyled(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>),
     FocusWindow(usize),
     /// Focus window by @N id lookup
     FocusWindowById(usize),
@@ -1297,7 +1301,7 @@ pub enum CtrlReq {
     /// string. Drop-in compat with iTerm2 and other CC clients that always
     /// pass `-F` to get structured output.
     SessionInfoFormat(mpsc::Sender<String>, String),
-    CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>),
+    CapturePaneRange(mpsc::Sender<String>, Option<i32>, Option<i32>, Option<usize>),
     ClientAttach(u64),
     ClientDetach(u64),
     DumpLayout(mpsc::Sender<String>),

@@ -1625,20 +1625,20 @@ pub fn run_server(session_name: String, socket_name: Option<String>, initial_com
                     if let Some(cmds) = app.hooks.get("before-kill-pane") { let cmds = cmds.clone(); for cmd in &cmds { let _ = execute_command_string(&mut app, cmd); } }
                     unzoom_if_zoomed(&mut app); let _ = kill_pane_by_id(&mut app, pid); resize_all_panes(&mut app); meta_dirty = true; hook_event = Some("after-kill-pane");
                 }
-                CtrlReq::CapturePane(resp) => {
+                CtrlReq::CapturePane(resp, target) => {
                     // Note: do NOT gate on is_active_pane_squelched here.
                     // Returning empty during the cd+cls squelch window makes
                     // iTerm2's initial attach paint a blank screen, since
                     // capture-pane is only requested once on attach.  Return
                     // current parser screen content; it's just cell text and
                     // any stale frame is harmless (subsequent %output rewrites).
-                    if let Some(text) = capture_active_pane_text(&mut app)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
+                    if let Some(text) = capture_active_pane_text(&mut app, target)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
-                CtrlReq::CapturePaneStyled(resp, s, e) => {
-                    if let Some(text) = capture_active_pane_styled(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
+                CtrlReq::CapturePaneStyled(resp, s, e, target) => {
+                    if let Some(text) = capture_active_pane_styled(&mut app, s, e, target)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
-                CtrlReq::CapturePaneRange(resp, s, e) => {
-                    if let Some(text) = capture_active_pane_range(&mut app, s, e)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
+                CtrlReq::CapturePaneRange(resp, s, e, target) => {
+                    if let Some(text) = capture_active_pane_range(&mut app, s, e, target)? { let _ = resp.send(text); } else { let _ = resp.send(String::new()); }
                 }
                 CtrlReq::FocusWindow(wid) => {
                     // wid is a display index (same as tmux window number), convert to internal array index

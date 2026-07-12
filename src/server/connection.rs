@@ -1068,12 +1068,15 @@ match cmd {
             }
         }
         let (rtx, rrx) = mpsc::channel::<String>();
+        // The capture is pinned to the resolved -t %N pane id (same
+        // settle_target_pane the probes use), so a concurrent request
+        // consuming the temp-focus restore can no longer redirect it.
         if escape_seqs {
-            let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end));
+            let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end, settle_target_pane));
         } else if s_arg.is_some() || e_arg.is_some() {
-            let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end));
+            let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end, settle_target_pane));
         } else {
-            let _ = tx.send(CtrlReq::CapturePane(rtx));
+            let _ = tx.send(CtrlReq::CapturePane(rtx, settle_target_pane));
         }
         if let Ok(mut text) = rrx.recv() {
             if join_lines {
@@ -3523,12 +3526,13 @@ fn dispatch_control_command(
             let end = args.windows(2).find(|w| w[0] == "-E").and_then(|w| w[1].parse::<i32>().ok());
             let styled = crate::cli::has_short_flag(&args, 'e');
             let (rtx, rrx) = mpsc::channel::<String>();
+            let pinned = if pane_is_id { target_pane } else { None };
             if styled {
-                let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end));
+                let _ = tx.send(CtrlReq::CapturePaneStyled(rtx, start, end, pinned));
             } else if start.is_some() || end.is_some() {
-                let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end));
+                let _ = tx.send(CtrlReq::CapturePaneRange(rtx, start, end, pinned));
             } else {
-                let _ = tx.send(CtrlReq::CapturePane(rtx));
+                let _ = tx.send(CtrlReq::CapturePane(rtx, pinned));
             }
             if let Ok(text) = rrx.recv_timeout(Duration::from_secs(5)) {
                 let _ = resp_tx.send(text);

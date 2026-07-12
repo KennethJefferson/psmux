@@ -596,9 +596,35 @@ fn push_capture_cell(row: &mut String, cell: Option<&vt100::Cell>) {
     }
 }
 
-pub fn capture_active_pane_text(app: &mut AppState) -> io::Result<Option<String>> {
-    let win = &mut app.windows[app.active_idx];
-    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };
+/// Resolve the pane a capture reads: the pane id the caller's `-t %N` named
+/// (pinned — immune to concurrent focus churn), or the active pane when no id
+/// was given. `-t` targeting otherwise rides on FocusPaneTemp, whose one-shot
+/// restore is consumed by the next non-probe request from ANY client; during
+/// a `--settle` wait that window is seconds long and a concurrent command
+/// (e.g. an agent's hook-notify) used to snap the final capture back to the
+/// wrong pane. Searches tiled trees first, then floating panes, all windows.
+fn capture_pane_mut(app: &mut AppState, target: Option<usize>) -> Option<&mut crate::types::Pane> {
+    match target {
+        Some(pid) => {
+            for i in 0..app.windows.len() {
+                if let Some(path) = crate::tree::find_path_by_id(&app.windows[i].root, pid) {
+                    return active_pane_mut(&mut app.windows[i].root, &path);
+                }
+                if let Some(fi) = app.windows[i].floating.iter().position(|f| f.pane.id == pid) {
+                    return Some(&mut app.windows[i].floating[fi].pane);
+                }
+            }
+            None
+        }
+        None => {
+            let win = &mut app.windows[app.active_idx];
+            active_pane_mut(&mut win.root, &win.active_path)
+        }
+    }
+}
+
+pub fn capture_active_pane_text(app: &mut AppState, target: Option<usize>) -> io::Result<Option<String>> {
+    let p = match capture_pane_mut(app, target) { Some(p) => p, None => return Ok(None) };
     let parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let screen = parser.screen();
     let mut text = String::new();
@@ -877,9 +903,8 @@ pub fn compute_capture_range(s: Option<i32>, e: Option<i32>, last_row: u16) -> (
     (start, end)
 }
 
-pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i32>) -> io::Result<Option<String>> {
-    let win = &mut app.windows[app.active_idx];
-    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };
+pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i32>, target: Option<usize>) -> io::Result<Option<String>> {
+    let p = match capture_pane_mut(app, target) { Some(p) => p, None => return Ok(None) };
     let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let rows = p.last_rows;
     let cols = p.last_cols;
@@ -973,9 +998,8 @@ pub fn capture_active_pane_range(app: &mut AppState, s: Option<i32>, e: Option<i
 /// Capture the active pane's screen content with ANSI escape sequences preserved.
 /// This is the `-e` flag for capture-pane.  Supports optional start/end range.
 /// Negative -S values read from scrollback history; i32::MIN means all retained history.
-pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<i32>) -> io::Result<Option<String>> {
-    let win = &mut app.windows[app.active_idx];
-    let p = match active_pane_mut(&mut win.root, &win.active_path) { Some(p) => p, None => return Ok(None) };
+pub fn capture_active_pane_styled(app: &mut AppState, s: Option<i32>, e: Option<i32>, target: Option<usize>) -> io::Result<Option<String>> {
+    let p = match capture_pane_mut(app, target) { Some(p) => p, None => return Ok(None) };
     let mut parser = match p.term.lock() { Ok(g) => g, Err(_) => return Ok(None) };
     let rows = p.last_rows;
     let cols = p.last_cols;
