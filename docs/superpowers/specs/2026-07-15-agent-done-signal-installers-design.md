@@ -2,7 +2,7 @@
 
 Date: 2026-07-15
 Branch: `feature/agent-events-done-signal`
-Status: approved, pre-implementation — **SCOPE REVISED to codex-only (2026-07-15)**
+Status: **IMPLEMENTED (codex-only), 2026-07-15** — pending final whole-branch review
 Predecessor: 2026-07-11-agent-events-design.md (increment 1, merged: PR #1 + #2)
 
 > **SCOPE REVISION (2026-07-15, before implementation):** Gate-0 inspection found that

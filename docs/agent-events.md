@@ -108,18 +108,24 @@ breaks the agent's hook protocol, even if psmux itself is unreachable), and is g
   identity env vars, this one is deliberately **not** protected — you're meant to be
   able to set it yourself.
 
-## Installing hooks: `psmux hooks install claude`
+## Installing hooks: `psmux hooks install <agent>`
 
 ```powershell
 psmux hooks install claude                # writes to ~/.claude/settings.json
 psmux hooks install claude --project-local  # writes to .claude/settings.local.json instead
 psmux hooks status claude                 # or: doctor
 psmux hooks uninstall claude
+
+psmux hooks install codex                 # writes to ~/.codex/hooks.json (global only)
+psmux hooks status codex                  # reports installed + trust state
+psmux hooks uninstall codex
 ```
 
-v1 ships one verified integration: **Claude Code**. `install` writes `Stop` (and
-`SessionStart`/`SessionEnd`) hook entries whose command is the psmux binary itself —
-no `.cmd`/`.ps1` wrapper, no PowerShell quoting or execution-policy surface to fight.
+Two verified integrations: **Claude Code** and **Codex**. `install` writes `Stop` (and,
+for claude, `SessionStart`/`SessionEnd`) hook entries whose command is the psmux binary
+itself — no `.cmd`/`.ps1` wrapper, no PowerShell quoting or execution-policy surface to
+fight. Codex wires only the `Stop` → `agent-done` done-signal (that is the whole point:
+a relay does `wait-event --name agent-done` instead of polling `capture-pane --settle`).
 
 The installer is safe to run repeatedly and safe next to hand-edited config:
 
@@ -130,6 +136,33 @@ The installer is safe to run repeatedly and safe next to hand-edited config:
   so `uninstall` removes exactly that and nothing else.
 - `--project-local` writes to `.claude/settings.local.json`, never `.claude/settings.json`
   — psmux will not silently commit executable hook config into your repo.
+- Idempotency is **exact-match**: a re-install with an unchanged binary path is a no-op
+  (no write), so it never needlessly disturbs a trust-gated config. A *stale* entry
+  (e.g. after the psmux binary moved) is detected as not-installed and repaired.
+
+### Codex: global-only + trust-hash
+
+Codex hooks live at `~/.codex/hooks.json` and are **global to every codex session** —
+there is no `--project-local` scope (the flag is rejected). Codex also **content-hash
+gates its hooks**: any edit to `hooks.json` invalidates the recorded `trusted_hash` in
+`~/.codex/config.toml`, and codex will prompt to **re-trust hooks on next launch**.
+`psmux hooks install codex` prints a warning to that effect, and `psmux hooks status
+codex` reports `trust-pending` until a matching trust entry exists.
+
+**This has a real consequence: until you accept the re-trust prompt, the Stop hook does
+not fire — so `agent-done` never publishes.** A relay that blocks on `wait-event` with no
+timeout would hang. Therefore, **always pass `--timeout` to `wait-event` in a relay** and
+fall back to `capture-pane --settle` on timeout. The bus is a latency optimization over
+polling, never a single point of hang:
+
+```powershell
+psmux wait-event --name agent-done --pane %1 --timeout 60   # exit 2 = timeout → fall back to settle
+```
+
+The installer's file safety (locked read-modify-write, backup-on-change-only, atomic
+rename-over-target, marker-scoped merge, exact-match idempotency) applies identically to
+codex's file — it never overwrites a config it could not fully read, and `uninstall`
+removes only psmux's own command, leaving any sibling hooks intact.
 
 ## `capture-pane --settle`
 
