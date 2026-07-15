@@ -74,12 +74,13 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     }
 }
 
-fn backup(path: &Path) -> Option<PathBuf> {
-    if !path.exists() { return None; }
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_millis();
+fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
+    if !path.exists() { return Ok(None); }
+    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
     let bak = path.with_extension(format!("json.bak-{}", ms));
-    std::fs::copy(path, &bak).ok()?;
-    Some(bak)
+    std::fs::copy(path, &bak).map_err(|e| format!("{}: backup failed: {}", path.display(), e))?;
+    Ok(Some(bak))
 }
 
 fn strip_owned(v: &mut serde_json::Value) -> bool {
@@ -104,7 +105,7 @@ pub fn install_claude(settings_path: &Path, psmux_exe: &Path) -> Result<InstallR
             v["hooks"][ev].as_array().map(|a| a.iter().any(is_owned)).unwrap_or(false)
         });
         if already { return Ok(InstallReport { changed: false, backup: None }); }
-        let bak = backup(settings_path);
+        let bak = backup(settings_path)?;
         strip_owned(&mut v); // remove stale versions before re-adding
         if !v["hooks"].is_object() { v["hooks"] = serde_json::json!({}); }
         for (ev, hook_ev) in [("Stop", "stop"), ("SessionStart", "session-start"), ("SessionEnd", "session-end")] {
@@ -123,8 +124,8 @@ pub fn uninstall_claude(settings_path: &Path) -> Result<InstallReport, String> {
     let lock = acquire_lock(settings_path)?;
     let result = (|| {
         let mut v = load(settings_path)?;
-        let bak = backup(settings_path);
         if !strip_owned(&mut v) { return Ok(InstallReport { changed: false, backup: None }); }
+        let bak = backup(settings_path)?;
         atomic_write(settings_path, &serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)?;
         Ok(InstallReport { changed: true, backup: bak })
     })();

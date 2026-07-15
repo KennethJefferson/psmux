@@ -132,6 +132,20 @@ fn load_non_not_found_read_error_is_err_not_empty() {
 }
 
 #[test]
+fn no_backup_on_noop_uninstall() {
+    let p = tmp("noop-uninstall");
+    std::fs::write(&p, r#"{"hooks":{}}"#).unwrap(); // nothing owned
+    let r = uninstall_claude(&p).unwrap();
+    assert!(!r.changed);
+    assert!(r.backup.is_none(), "no-op uninstall must not create a backup");
+    let dir = p.parent().unwrap();
+    let baks: Vec<_> = std::fs::read_dir(dir).unwrap().filter_map(|e| e.ok())
+        .map(|e| e.file_name().into_string().unwrap())
+        .filter(|n| n.contains(".bak-")).collect();
+    assert!(baks.is_empty(), "backup leaked on no-op: {:?}", baks);
+}
+
+#[test]
 fn atomic_write_replaces_without_transient_delete() {
     let p = tmp("atomic");
     std::fs::write(&p, "OLD").unwrap();
