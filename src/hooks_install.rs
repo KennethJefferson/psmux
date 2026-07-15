@@ -101,28 +101,39 @@ fn strip_owned(v: &mut serde_json::Value, marker: &str) -> bool {
     changed
 }
 
-pub fn install_claude(settings_path: &Path, psmux_exe: &Path) -> Result<InstallReport, String> {
-    let marker = owned_marker("claude");
-    let lock = acquire_lock(settings_path)?;
+fn install_json_hooks(path: &Path, exe: &Path, agent: &str, events: &[(&str, &str)]) -> Result<InstallReport, String> {
+    let marker = owned_marker(agent);
+    let lock = acquire_lock(path)?;
     let result = (|| {
-        let mut v = load(settings_path)?; // reread under lock
-        let already = ["Stop", "SessionStart", "SessionEnd"].iter().all(|ev| {
-            v["hooks"][ev].as_array().map(|a| a.iter().any(|g| is_owned(g, &marker))).unwrap_or(false)
+        let mut v = load(path)?; // reread under lock
+        // "installed" = every event already contains our EXACT desired group.
+        let already = events.iter().all(|(file_key, arg)| {
+            let want = desired_group(exe, agent, arg);
+            v["hooks"][file_key].as_array().map(|_| event_has_exact(&v["hooks"][file_key], &want)).unwrap_or(false)
         });
         if already { return Ok(InstallReport { changed: false, backup: None }); }
-        let bak = backup(settings_path)?;
-        strip_owned(&mut v, &marker); // remove stale versions before re-adding
+        let bak = backup(path)?;
+        strip_owned(&mut v, &marker); // remove any stale owned groups first
         if !v["hooks"].is_object() { v["hooks"] = serde_json::json!({}); }
-        for (ev, hook_ev) in [("Stop", "stop"), ("SessionStart", "session-start"), ("SessionEnd", "session-end")] {
-            if !v["hooks"][ev].is_array() { v["hooks"][ev] = serde_json::json!([]); }
-            v["hooks"][ev].as_array_mut().unwrap().push(desired_group(psmux_exe, "claude", hook_ev));
+        for (file_key, arg) in events {
+            if !v["hooks"][file_key].is_array() { v["hooks"][file_key] = serde_json::json!([]); }
+            v["hooks"][file_key].as_array_mut().unwrap().push(desired_group(exe, agent, arg));
         }
-        atomic_write(settings_path, &serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)?;
-        write_manifest(settings_path)?;
+        atomic_write(path, &serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)?;
+        write_manifest(path, agent)?;
         Ok(InstallReport { changed: true, backup: bak })
     })();
     let _ = std::fs::remove_file(lock);
     result
+}
+
+pub fn install_codex(path: &Path, exe: &Path) -> Result<InstallReport, String> {
+    install_json_hooks(path, exe, "codex", &[("Stop", "stop")])
+}
+
+pub fn install_claude(settings_path: &Path, psmux_exe: &Path) -> Result<InstallReport, String> {
+    install_json_hooks(settings_path, psmux_exe, "claude",
+        &[("Stop", "stop"), ("SessionStart", "session-start"), ("SessionEnd", "session-end")])
 }
 
 pub fn uninstall_claude(settings_path: &Path) -> Result<InstallReport, String> {
@@ -166,21 +177,30 @@ fn manifest_path() -> PathBuf {
     Path::new(&home).join(".psmux").join("hooks-manifest.json")
 }
 
-fn write_manifest(settings_path: &Path) -> Result<(), String> {
+// The manifest is shared across all agents/installs (unlike each agent's own
+// settings file), so concurrent installs racing a read-modify-write on it can
+// lose an update. Serialize with the same sibling-lockfile scheme used for
+// settings files, keyed off the manifest path itself.
+fn write_manifest(settings_path: &Path, agent: &str) -> Result<(), String> {
     let mp = manifest_path();
     if let Some(d) = mp.parent() { let _ = std::fs::create_dir_all(d); }
-    let mut m: serde_json::Value = std::fs::read_to_string(&mp).ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_else(|| serde_json::json!({}));
-    let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64).unwrap_or(0);
-    m["claude"] = serde_json::json!({
-        "path": settings_path.display().to_string(),
-        "installed_at_ms": ms,
-        "psmux_version": env!("CARGO_PKG_VERSION"),
-    });
-    std::fs::write(&mp, serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    let lock = acquire_lock(&mp)?;
+    let result = (|| {
+        let mut m: serde_json::Value = std::fs::read_to_string(&mp).ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64).unwrap_or(0);
+        m[agent] = serde_json::json!({
+            "path": settings_path.display().to_string(),
+            "installed_at_ms": ms,
+            "psmux_version": env!("CARGO_PKG_VERSION"),
+        });
+        std::fs::write(&mp, serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(lock);
+    result
 }
 
 #[cfg(test)]

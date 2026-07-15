@@ -177,3 +177,28 @@ fn owned_marker_is_per_agent() {
     assert_eq!(owned_marker("codex"), " hook-notify codex ");
     assert_eq!(owned_marker("gemini"), " hook-notify gemini ");
 }
+
+#[test]
+fn install_codex_writes_stop_only_exact() {
+    let p = tmp("codex-fresh");
+    let exe = std::path::Path::new("C:\\bin\\psmux.exe");
+    let r = install_codex(&p, exe).unwrap();
+    assert!(r.changed);
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let cmd = v["hooks"]["Stop"][0]["hooks"][0]["command"].as_str().unwrap();
+    assert!(cmd.contains("hook-notify codex stop"));
+    assert!(v["hooks"]["SessionStart"].is_null(), "codex is done-signal only");
+    // Re-install is a no-op (exact match) — no second write.
+    let r2 = install_codex(&p, exe).unwrap();
+    assert!(!r2.changed, "exact re-install must be a no-op");
+}
+
+#[test]
+fn install_codex_preserves_sibling_group() {
+    let p = tmp("codex-sibling");
+    std::fs::write(&p, r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"other.exe"}]}]}}"#).unwrap();
+    install_codex(&p, std::path::Path::new("C:\\bin\\psmux.exe")).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let groups = v["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "must ADD alongside the existing group, not clobber");
+}
