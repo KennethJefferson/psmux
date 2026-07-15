@@ -104,3 +104,29 @@ fn install_creates_backup_when_file_existed() {
     assert!(r.backup.is_some());
     assert!(r.backup.unwrap().exists());
 }
+
+#[test]
+fn load_missing_file_is_empty_object() {
+    let p = tmp("load-missing");
+    // tmp() creates the dir but not the file
+    let v = load(&p).unwrap();
+    assert!(v.is_object() && v.as_object().unwrap().is_empty());
+}
+
+#[test]
+fn load_invalid_json_is_err_not_empty() {
+    let p = tmp("load-bad");
+    std::fs::write(&p, "{ not json").unwrap();
+    assert!(load(&p).is_err(), "invalid JSON must abort, not coerce to empty");
+}
+
+#[test]
+fn load_non_not_found_read_error_is_err_not_empty() {
+    // Passing a directory (not a missing path) forces a non-NotFound read
+    // error (e.g. "Is a directory" / access-denied), portably across platforms.
+    // This must NOT be coerced to Ok({}) the way a genuine NotFound is.
+    let p = tmp("load-direrr");
+    std::fs::create_dir_all(&p).unwrap(); // p itself is now a directory, not a file
+    let r = load(&p);
+    assert!(r.is_err(), "non-NotFound read error must abort, not coerce to empty");
+}

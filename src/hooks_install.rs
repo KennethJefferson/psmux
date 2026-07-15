@@ -27,7 +27,8 @@ fn load(path: &Path) -> Result<serde_json::Value, String> {
     match std::fs::read_to_string(path) {
         Ok(s) if s.trim().is_empty() => Ok(serde_json::json!({})),
         Ok(s) => serde_json::from_str(&s).map_err(|e| format!("{}: invalid JSON: {}", path.display(), e)),
-        Err(_) => Ok(serde_json::json!({})),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(e) => Err(format!("{}: cannot read (refusing to overwrite): {}", path.display(), e)),
     }
 }
 
