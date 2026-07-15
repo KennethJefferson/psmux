@@ -158,3 +158,22 @@ fn atomic_write_replaces_without_transient_delete() {
         .filter(|n| n.contains("psmux-tmp")).collect();
     assert!(leftovers.is_empty(), "temp file leaked: {:?}", leftovers);
 }
+
+#[test]
+fn exact_match_detects_stale_command() {
+    let exe = std::path::Path::new("C:\\bin\\psmux.exe");
+    let want = desired_group(exe, "codex", "stop");
+    // A stale group with a DIFFERENT exe path must NOT count as exact.
+    let stale = serde_json::json!({"hooks":[{"type":"command",
+        "command":"\"C:\\\\old\\\\psmux.exe\" hook-notify codex stop","timeout":10}]});
+    let arr = serde_json::json!([stale]);
+    assert!(!event_has_exact(&arr, &want), "stale exe must not match exact");
+    let arr2 = serde_json::json!([want.clone()]);
+    assert!(event_has_exact(&arr2, &want), "identical group must match");
+}
+
+#[test]
+fn owned_marker_is_per_agent() {
+    assert_eq!(owned_marker("codex"), " hook-notify codex ");
+    assert_eq!(owned_marker("gemini"), " hook-notify gemini ");
+}

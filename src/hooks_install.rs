@@ -5,21 +5,25 @@ pub struct InstallReport {
     pub backup: Option<PathBuf>,
 }
 
-const OWNED_MARKER: &str = " hook-notify claude ";
+fn owned_marker(agent: &str) -> String { format!(" hook-notify {} ", agent) }
 
-fn hook_entry(psmux_exe: &Path, event: &str) -> serde_json::Value {
+fn desired_group(psmux_exe: &Path, agent: &str, arg: &str) -> serde_json::Value {
     serde_json::json!({
         "hooks": [{
             "type": "command",
-            "command": format!("\"{}\" hook-notify claude {}", psmux_exe.display(), event),
+            "command": format!("\"{}\" hook-notify {} {}", psmux_exe.display(), agent, arg),
             "timeout": 10
         }]
     })
 }
 
-fn is_owned(group: &serde_json::Value) -> bool {
+fn event_has_exact(arr: &serde_json::Value, want: &serde_json::Value) -> bool {
+    arr.as_array().map(|gs| gs.iter().any(|g| g == want)).unwrap_or(false)
+}
+
+fn is_owned(group: &serde_json::Value, marker: &str) -> bool {
     group["hooks"].as_array().map(|hs| {
-        hs.iter().any(|h| h["command"].as_str().map(|c| c.contains(OWNED_MARKER)).unwrap_or(false))
+        hs.iter().any(|h| h["command"].as_str().map(|c| c.contains(marker)).unwrap_or(false))
     }).unwrap_or(false)
 }
 
@@ -83,13 +87,13 @@ fn backup(path: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(bak))
 }
 
-fn strip_owned(v: &mut serde_json::Value) -> bool {
+fn strip_owned(v: &mut serde_json::Value, marker: &str) -> bool {
     let mut changed = false;
     if let Some(events) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) {
         for (_ev, arr) in events.iter_mut() {
             if let Some(groups) = arr.as_array_mut() {
                 let before = groups.len();
-                groups.retain(|g| !is_owned(g));
+                groups.retain(|g| !is_owned(g, marker));
                 changed |= groups.len() != before;
             }
         }
@@ -98,19 +102,20 @@ fn strip_owned(v: &mut serde_json::Value) -> bool {
 }
 
 pub fn install_claude(settings_path: &Path, psmux_exe: &Path) -> Result<InstallReport, String> {
+    let marker = owned_marker("claude");
     let lock = acquire_lock(settings_path)?;
     let result = (|| {
         let mut v = load(settings_path)?; // reread under lock
         let already = ["Stop", "SessionStart", "SessionEnd"].iter().all(|ev| {
-            v["hooks"][ev].as_array().map(|a| a.iter().any(is_owned)).unwrap_or(false)
+            v["hooks"][ev].as_array().map(|a| a.iter().any(|g| is_owned(g, &marker))).unwrap_or(false)
         });
         if already { return Ok(InstallReport { changed: false, backup: None }); }
         let bak = backup(settings_path)?;
-        strip_owned(&mut v); // remove stale versions before re-adding
+        strip_owned(&mut v, &marker); // remove stale versions before re-adding
         if !v["hooks"].is_object() { v["hooks"] = serde_json::json!({}); }
         for (ev, hook_ev) in [("Stop", "stop"), ("SessionStart", "session-start"), ("SessionEnd", "session-end")] {
             if !v["hooks"][ev].is_array() { v["hooks"][ev] = serde_json::json!([]); }
-            v["hooks"][ev].as_array_mut().unwrap().push(hook_entry(psmux_exe, hook_ev));
+            v["hooks"][ev].as_array_mut().unwrap().push(desired_group(psmux_exe, "claude", hook_ev));
         }
         atomic_write(settings_path, &serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)?;
         write_manifest(settings_path)?;
@@ -121,10 +126,11 @@ pub fn install_claude(settings_path: &Path, psmux_exe: &Path) -> Result<InstallR
 }
 
 pub fn uninstall_claude(settings_path: &Path) -> Result<InstallReport, String> {
+    let marker = owned_marker("claude");
     let lock = acquire_lock(settings_path)?;
     let result = (|| {
         let mut v = load(settings_path)?;
-        if !strip_owned(&mut v) { return Ok(InstallReport { changed: false, backup: None }); }
+        if !strip_owned(&mut v, &marker) { return Ok(InstallReport { changed: false, backup: None }); }
         let bak = backup(settings_path)?;
         atomic_write(settings_path, &serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)?;
         Ok(InstallReport { changed: true, backup: bak })
@@ -134,9 +140,10 @@ pub fn uninstall_claude(settings_path: &Path) -> Result<InstallReport, String> {
 }
 
 pub fn status_claude(settings_path: &Path) -> String {
+    let marker = owned_marker("claude");
     match load(settings_path) {
         Ok(v) => {
-            let installed = v["hooks"]["Stop"].as_array().map(|a| a.iter().any(is_owned)).unwrap_or(false);
+            let installed = v["hooks"]["Stop"].as_array().map(|a| a.iter().any(|g| is_owned(g, &marker))).unwrap_or(false);
             format!("claude: {} ({})", if installed { "installed" } else { "not installed" }, settings_path.display())
         }
         Err(e) => format!("claude: unreadable ({})", e),
