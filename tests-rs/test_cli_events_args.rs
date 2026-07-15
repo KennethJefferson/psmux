@@ -86,13 +86,21 @@ fn stream_read_error_is_transport_loss() {
 #[test]
 fn warm_claimed_pane_detection() {
     // TMUX_PANE set + PSMUX_PANE_INSTANCE absent/empty => warm-claimed initial pane.
-    assert!(is_warm_claimed_pane(Some("%1"), None));
-    assert!(is_warm_claimed_pane(Some("%1"), Some("")));
+    assert!(is_warm_claimed_pane(Some("%1"), None, "sess-uid-abc"));
+    assert!(is_warm_claimed_pane(Some("%1"), Some(""), "sess-uid-abc"));
     // Normal cold-spawned pane: both present.
-    assert!(!is_warm_claimed_pane(Some("%1"), Some("3")));
+    assert!(!is_warm_claimed_pane(Some("%1"), Some("3"), "sess-uid-abc"));
     // Fully outside psmux: TMUX_PANE itself absent — not the warm-claim case.
-    assert!(!is_warm_claimed_pane(None, None));
-    assert!(!is_warm_claimed_pane(Some(""), None));
+    assert!(!is_warm_claimed_pane(None, None, "sess-uid-abc"));
+    assert!(!is_warm_claimed_pane(Some(""), None, "sess-uid-abc"));
+}
+
+#[test]
+fn plain_tmux_without_psmux_marker_is_not_warm_claimed() {
+    // TMUX_PANE set (plain tmux), no instance, and crucially no PSMUX_SESSION_UID.
+    assert!(!is_warm_claimed_pane(Some("%3"), None, ""));
+    // Inside psmux (session uid present) but instance missing => warm-claimed.
+    assert!(is_warm_claimed_pane(Some("%3"), None, "sess-uid-abc"));
 }
 
 #[test]

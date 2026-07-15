@@ -4706,8 +4706,9 @@ impl NotifyEnv {
 /// got its shell by claiming a warm `__warm__` standby, which never had
 /// identity env baked in (see docs/agent-events.md warm caveat). Pure helper
 /// so it's trivially unit-testable without touching real process env.
-pub(crate) fn is_warm_claimed_pane(tmux_pane: Option<&str>, pane_instance: Option<&str>) -> bool {
-    tmux_pane.map(|v| !v.is_empty()).unwrap_or(false)
+pub(crate) fn is_warm_claimed_pane(tmux_pane: Option<&str>, pane_instance: Option<&str>, session_uid: &str) -> bool {
+    !session_uid.is_empty() // only inside psmux at all
+        && tmux_pane.map(|v| !v.is_empty()).unwrap_or(false)
         && pane_instance.map(|v| v.is_empty()).unwrap_or(true)
 }
 
@@ -4719,7 +4720,8 @@ pub(crate) fn is_warm_claimed_pane(tmux_pane: Option<&str>, pane_instance: Optio
 fn warn_if_warm_claimed_pane() {
     let tmux_pane = std::env::var("TMUX_PANE").ok();
     let pane_instance = std::env::var("PSMUX_PANE_INSTANCE").ok();
-    if is_warm_claimed_pane(tmux_pane.as_deref(), pane_instance.as_deref()) {
+    let session_uid = std::env::var("PSMUX_SESSION_UID").unwrap_or_default();
+    if is_warm_claimed_pane(tmux_pane.as_deref(), pane_instance.as_deref(), &session_uid) {
         eprintln!("psmux: this pane has no identity (warm-claimed initial pane?) - notify skipped; see docs/agent-events.md warm caveat or set PSMUX_NO_WARM=1");
     }
 }
