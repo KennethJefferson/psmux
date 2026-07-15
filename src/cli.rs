@@ -203,6 +203,8 @@ AGENT EVENTS COMMANDS:
     wait-event                 Block until a matching event (--pane/--name/--after/--timeout)
     notify                     Publish an agent event from inside a pane (--done)
     hook-notify                Agent hook entrypoint (reads stdin, prints {{}})
+    hooks                      Install/uninstall/status agent hooks: claude|codex
+                                (codex is global-only; re-trust prompt on next launch)
 
 MISC:
     help                    Show this help message
@@ -460,6 +462,9 @@ pub fn print_commands() {
   find-window (findw)       - Search for a window by name
   has-session               - Check if a session exists
   hook-notify               - Agent hook entrypoint (reads stdin, prints {{}})
+  hooks                     - Install/uninstall/status agent hooks: claude|codex
+                              (claude: project-local or global; codex: global only,
+                              prompts to re-trust hooks.json on next codex launch)
   if-shell (if)             - Conditional command execution
   join-pane                 - Join a pane to a window
   kill-pane                 - Kill a pane

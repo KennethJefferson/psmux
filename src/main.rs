@@ -3897,38 +3897,61 @@ fn run_main() -> io::Result<()> {
                 println!("{{}}");
                 return Ok(());
             }
-            // hooks - Install/uninstall/status the Claude Code hook wiring in settings.json
+            // hooks - Install/uninstall/status the agent hook wiring (claude settings.json, codex hooks.json)
             "hooks" => {
                 let sub = cmd_args.get(1).map(|s| s.as_str()).unwrap_or("");
                 let agent = cmd_args.get(2).map(|s| s.as_str()).unwrap_or("");
-                if agent != "claude" {
-                    eprintln!("psmux hooks: only 'claude' is supported in this version");
-                    std::process::exit(1);
-                }
                 let project_local = cmd_args.iter().any(|a| a.as_str() == "--project-local");
-                let settings = if project_local {
-                    std::path::PathBuf::from(".claude").join("settings.local.json")
-                } else {
-                    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
-                    std::path::Path::new(&home).join(".claude").join("settings.json")
+                let exe = std::env::current_exe()?;
+                let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+
+                // Resolve settings path + event list per agent.
+                let (settings, events): (std::path::PathBuf, &[(&str, &str)]) = match agent {
+                    "claude" => {
+                        let p = if project_local {
+                            std::path::PathBuf::from(".claude").join("settings.local.json")
+                        } else {
+                            if home.is_empty() { eprintln!("psmux hooks: no home dir"); std::process::exit(1); }
+                            std::path::Path::new(&home).join(".claude").join("settings.json")
+                        };
+                        (p, &[("Stop", "stop"), ("SessionStart", "session-start"), ("SessionEnd", "session-end")])
+                    }
+                    "codex" => {
+                        if project_local {
+                            eprintln!("psmux hooks: --project-local is not valid for {} (global only)", agent);
+                            std::process::exit(1);
+                        }
+                        if home.is_empty() { eprintln!("psmux hooks: no home dir"); std::process::exit(1); }
+                        (std::path::Path::new(&home).join(".codex").join("hooks.json"), &[("Stop", "stop")])
+                    }
+                    _ => {
+                        eprintln!("psmux hooks: agent must be claude|codex");
+                        std::process::exit(1);
+                    }
                 };
+
                 match sub {
                     "install" => {
-                        let exe = std::env::current_exe()?;
-                        let r = hooks_install::install_claude(&settings, &exe)
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                        println!("claude hooks: {}{}",
+                        let r = match agent {
+                            "claude" => hooks_install::install_claude(&settings, &exe),
+                            "codex" => hooks_install::install_codex(&settings, &exe),
+                            _ => unreachable!(),
+                        }.map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                        println!("{} hooks: {}{}", agent,
                             if r.changed { "installed" } else { "already installed" },
                             r.backup.map(|b| format!(" (backup: {})", b.display())).unwrap_or_default());
+                        if agent == "codex" && r.changed {
+                            eprintln!("psmux: codex will prompt to RE-TRUST hooks on next launch; until accepted, the done-signal will NOT fire. Relays must use `wait-event --timeout`.");
+                        }
                     }
                     "uninstall" => {
-                        let r = hooks_install::uninstall_claude(&settings)
+                        let r = hooks_install::uninstall_agent(&settings, agent)
                             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                        println!("claude hooks: {}", if r.changed { "removed" } else { "nothing to remove" });
+                        println!("{} hooks: {}", agent, if r.changed { "removed" } else { "nothing to remove" });
                     }
-                    "status" | "doctor" => println!("{}", hooks_install::status_claude(&settings)),
+                    "status" | "doctor" => println!("{}", hooks_install::status_agent(&settings, agent, events, &exe)),
                     _ => {
-                        eprintln!("usage: psmux hooks <install|uninstall|status> claude [--project-local]");
+                        eprintln!("usage: psmux hooks <install|uninstall|status> claude|codex [--project-local]");
                         std::process::exit(1);
                     }
                 }
