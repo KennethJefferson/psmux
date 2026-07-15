@@ -1,10 +1,16 @@
-# Event-Driven Done-Signal Installers (codex & gemini) Implementation Plan
+# Event-Driven Done-Signal Installer (codex) Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add `psmux hooks install codex|gemini` so codex/gemini panes publish `agent-done` onto the event bus, replacing settle-polling with `wait-event`.
+> **SCOPE REVISED 2026-07-15 → CODEX-ONLY.** Gate inspection found antigravity (`agy`) has no
+> hook mechanism, so the gemini/agy installer cannot be built. **Task 7 (gemini installer) is
+> DROPPED. Tasks 0/9/10 are codex-only.** The shared-spine hardening (Tasks 1-3), per-agent
+> marker/idempotency (4-6), and warning fix (8) are retained — justified for codex alone and they
+> harden claude's shipped path. See spec's scope-revision banner and `.superpowers/sdd/progress.md`.
 
-**Architecture:** Extend the existing `src/hooks_install.rs` Claude installer and the `hooks` CLI verb in `src/main.rs`. First harden the shared file primitives (they become load-bearing on gemini's credential file), then add codex (same schema as claude) and gemini (hooks nested in a user-owned settings.json) installers, with codex trust-hash defenses. An early live gate proves codex/gemini preserve `PSMUX_*` env into the hook subprocess before we build on that assumption.
+**Goal:** Add `psmux hooks install codex` so codex panes publish `agent-done` onto the event bus, replacing settle-polling with `wait-event`.
+
+**Architecture:** Extend the existing `src/hooks_install.rs` Claude installer and the `hooks` CLI verb in `src/main.rs`. First harden the shared file primitives, then add the codex installer (same hooks.json schema as claude) with trust-hash defenses. An early live gate proves codex preserves `PSMUX_*` env into the hook subprocess before we build on that assumption.
 
 **Tech Stack:** Rust, `serde_json`, existing psmux test conventions (`tests-rs/` modules, `#[cfg(test)]` include, `PSMUX_HOOKS_MANIFEST_DIR` sandbox).
 
@@ -14,16 +20,16 @@
 - Branch: `feature/agent-events-done-signal`.
 - Elevated dev shell: any live psmux run needs `PSMUX_ALLOW_ELEVATED=1`.
 - Build/test single pass only: `cargo test --bin psmux` (NEVER background cargo on this machine; NEVER `cargo test` full — runs 3× ~3min).
-- codex/gemini hooks are **global-only** (no `--project-local`). gemini's `~/.gemini/settings.json` is **user-owned** (holds oauth + retention) — writes must be loss-safe.
-- Scope is **done-signal only**: one hook event per agent → `agent-done`.
+- codex hooks are **global-only** (no `--project-local`), at `~/.codex/hooks.json`, and **trust-hash gated** (`config.toml [hooks.state]`) — any edit triggers a re-trust prompt; exact-match idempotency avoids needless re-writes.
+- Scope is **done-signal only, CODEX ONLY**: one hook event (`Stop` → `agent-done`). Gemini/agy dropped (agy has no hooks).
 - Marker convention: owned command substring is `" hook-notify <agent> "` (leading+trailing space), matching the existing `OWNED_MARKER = " hook-notify claude "`.
 - Event round-trip: installer command passes a **hook-notify arg** (`stop` / `agent-turn-complete`) that `parse_hook_event_name` maps to `agent-done`. The **file-key** (JSON `hooks.<Event>` key) is the agent's own event name (codex `Stop`, gemini `AfterAgent`).
 
 ---
 
-## Task 0: Live env-propagation gate (BLOCKING — run before writing any installer code)
+## Task 0: Live env-propagation gate (BLOCKING — run before writing any installer code) — CODEX ONLY
 
-**Purpose:** Prove codex and gemini preserve `PSMUX_PANE_INSTANCE` + `PSMUX_SESSION_UID` into a hook subprocess. If either sanitizes env, `hook-notify` is a silent no-op for that agent and the whole feature is void for it — discover it now (spec §11).
+**Purpose:** Prove **codex** preserves `PSMUX_PANE_INSTANCE` + `PSMUX_SESSION_UID` into a hook subprocess. If codex sanitizes env, `hook-notify` is a silent no-op and the whole feature is void — discover it now (spec §11). (Gemini/agy dropped: agy has no hooks; not gated.)
 
 **Files:**
 - Create: `tests/gate_env_propagation.ps1` (manual live gate, not a cargo test)
@@ -651,7 +657,11 @@ git commit -m "feat(hooks): command-level uninstall + generic status/manifest pe
 
 ---
 
-## Task 7: `install_gemini` — settings.json-nested, credential-safe
+## Task 7: `install_gemini` — settings.json-nested, credential-safe — **DROPPED (codex-only scope)**
+
+> **NOT IMPLEMENTED.** Scope revised to codex-only 2026-07-15: antigravity (`agy`, the gemini-family
+> CLI in use) has no hook mechanism, and the Google gemini CLI is not used. Skip this task entirely.
+> The original spec below is retained for the record only, in case a gemini installer is revived later.
 
 **Files:**
 - Modify: `src/hooks_install.rs` (add `install_gemini`; reuse hardened primitives + generic uninstall/status)

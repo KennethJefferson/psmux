@@ -2,8 +2,18 @@
 
 Date: 2026-07-15
 Branch: `feature/agent-events-done-signal`
-Status: approved, pre-implementation
+Status: approved, pre-implementation — **SCOPE REVISED to codex-only (2026-07-15)**
 Predecessor: 2026-07-11-agent-events-design.md (increment 1, merged: PR #1 + #2)
+
+> **SCOPE REVISION (2026-07-15, before implementation):** Gate-0 inspection found that
+> **antigravity (`agy`, the gemini-family CLI actually used for relays) has NO hook mechanism**
+> — no hook file, no hook/notify/event flags, only `plugin` management. The event-driven
+> done-signal is impossible on antigravity's side; agy relays keep settle-polling (which works).
+> The Google **gemini CLI** (`~/.gemini/settings.json`) *is* hook-capable but is not the CLI in
+> use. Decision: **this branch ships the CODEX installer only.** All "gemini" installer content
+> below is DEFERRED/not-built. Retained: shared-spine hardening (§5), exact-match idempotency
+> (§6), codex trust-hash defense (§7), real-tmux warning fix (§8) — all justified for codex alone
+> (its hooks.json is trust-gated) and they harden claude's shipped path too.
 
 ## 1. Purpose
 
