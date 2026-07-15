@@ -2,7 +2,11 @@
 
 Date: 2026-07-15
 Branch: `feature/agent-events-done-signal`
-Status: **IMPLEMENTED (codex-only), 2026-07-15** — pending final whole-branch review
+Status: **IMPLEMENTED + LIVE E2E VERIFIED (codex-only), 2026-07-15** — awaiting merge decision.
+Post-review amendment: codex executes hook commands via `powershell.exe -NoProfile -Command`,
+so the installed command uses the call-operator form `& '<exe>' hook-notify codex stop`
+(bare `"<exe>" args` is a PS parser error → hook exits 1). `wait-event --timeout` is
+milliseconds; codex's hooks.json `timeout` field is seconds.
 Predecessor: 2026-07-11-agent-events-design.md (increment 1, merged: PR #1 + #2)
 
 > **SCOPE REVISION (2026-07-15, before implementation):** Gate-0 inspection found that
