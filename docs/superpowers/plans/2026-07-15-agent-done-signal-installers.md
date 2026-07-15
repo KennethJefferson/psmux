@@ -930,3 +930,72 @@ git commit -m "test(e2e): live done-signal via codex/gemini installed hooks"
 git add docs/agent-events.md docs/superpowers/specs/2026-07-15-agent-done-signal-installers-design.md
 git commit -m "docs: codex/gemini done-signal installers + trust/timeout guidance"
 ```
+
+---
+
+## Task 12: Fix codex hook command format — PowerShell call-operator (ADDED post-e2e root-cause)
+
+**Why (root cause, triple-confirmed):** codex 0.144.4 runs a hooks.json `type:"command"` string via
+`powershell.exe -NoProfile -Command <string>`. The installed form `"<exe>" hook-notify codex stop`
+is a PowerShell parser error ("Unexpected token 'hook-notify'") → PS exits 1 → codex reports
+"Stop hook (failed): hook exited with code 1" → no agent-done published. Verified: the
+call-operator form `& '<exe>' hook-notify codex stop` prints `{}` exit 0 under the same runner.
+`hook-notify` itself is flawless in codex's real context (wrapper diag: identity env present, exit 0).
+Claude's runner handles the old quoted form fine — claude format UNCHANGED.
+
+**Files:**
+- Modify: `src/hooks_install.rs` (`desired_group` — per-agent command format)
+- Test: `tests-rs/test_hooks_install.rs` (update codex assertions, add format test)
+
+**Interfaces:** `desired_group(psmux_exe, agent, arg)` signature unchanged; codex command string
+becomes `& '<exe>' hook-notify codex <arg>` (single quotes in path escaped by doubling).
+Marker `" hook-notify codex "` still present in the string — is_owned/strip logic unchanged.
+
+- [ ] **Step 1: Write the failing test**
+
+```rust
+#[test]
+fn codex_command_uses_powershell_call_operator() {
+    let exe = std::path::Path::new("C:\bin\psmux.exe");
+    let g = desired_group(exe, "codex", "stop");
+    let cmd = g["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(cmd, "& 'C:\bin\psmux.exe' hook-notify codex stop",
+        "codex hooks run via powershell -Command; must use call-operator form");
+    // claude keeps the proven quoted form
+    let gc = desired_group(exe, "claude", "stop");
+    let cmdc = gc["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(cmdc, "\"C:\bin\psmux.exe\" hook-notify claude stop");
+}
+```
+
+- [ ] **Step 2: Run to verify it fails** — `cargo test --bin psmux codex_command_uses_powershell -- --nocapture` → FAIL (current format is the quoted form for all agents).
+
+- [ ] **Step 3: Implement** — in `desired_group`, build the command per agent:
+
+```rust
+fn desired_group(psmux_exe: &Path, agent: &str, arg: &str) -> serde_json::Value {
+    // codex executes hook commands via `powershell.exe -NoProfile -Command <string>`;
+    // a bare "quoted-exe" args string is a PS parser error (exit 1, hook reported failed).
+    // The call operator with a single-quoted path is the form PS actually invokes.
+    // claude's runner handles the plain quoted form — keep it (proven since increment 1).
+    let command = if agent == "codex" {
+        format!("& '{}' hook-notify {} {}", psmux_exe.display().to_string().replace('\'', "''"), agent, arg)
+    } else {
+        format!("\"{}\" hook-notify {} {}", psmux_exe.display(), agent, arg)
+    };
+    serde_json::json!({ "hooks": [{ "type": "command", "command": command, "timeout": 10 }] })
+}
+```
+
+- [ ] **Step 4: Fix any codex-test assertions** that expected the old format (e.g. `install_codex_writes_stop_only_exact` checks `contains("hook-notify codex stop")` — still passes; any exact-string assertions need the new form). Run `cargo test --bin psmux hooks` → all green.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/hooks_install.rs tests-rs/test_hooks_install.rs
+git commit -m "fix(hooks): codex command uses PowerShell call-operator form"
+```
+
+**Follow-up (same task):** spec §7 note — codex `timeout` is SECONDS; hook config is captured at
+codex session start (install BEFORE launching codex). Optional future: `commandWindows` field
+(unverified in 0.144.4; not used).
