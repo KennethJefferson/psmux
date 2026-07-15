@@ -56,12 +56,22 @@ fn acquire_lock(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
-    if let Some(dir) = path.parent() { let _ = std::fs::create_dir_all(dir); }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {}", dir.display(), e))?;
+    }
     let tmp = path.with_extension("json.psmux-tmp");
     std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
-    // same-directory replace
-    let _ = std::fs::remove_file(path);
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    // Rename directly over the target (atomic replace on Windows & Unix when
+    // same directory). Do NOT remove the original first — a crash between a
+    // delete and a rename would leave the file missing.
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // Best-effort cleanup so a failed replace doesn't leak the tmp.
+            let _ = std::fs::remove_file(&tmp);
+            Err(format!("{}: atomic replace failed: {}", path.display(), e))
+        }
+    }
 }
 
 fn backup(path: &Path) -> Option<PathBuf> {

@@ -130,3 +130,17 @@ fn load_non_not_found_read_error_is_err_not_empty() {
     let r = load(&p);
     assert!(r.is_err(), "non-NotFound read error must abort, not coerce to empty");
 }
+
+#[test]
+fn atomic_write_replaces_without_transient_delete() {
+    let p = tmp("atomic");
+    std::fs::write(&p, "OLD").unwrap();
+    atomic_write(&p, "NEW").unwrap();
+    assert_eq!(std::fs::read_to_string(&p).unwrap(), "NEW");
+    // No stray tmp/backup left in the dir besides the file itself.
+    let dir = p.parent().unwrap();
+    let leftovers: Vec<_> = std::fs::read_dir(dir).unwrap()
+        .filter_map(|e| e.ok()).map(|e| e.file_name().into_string().unwrap())
+        .filter(|n| n.contains("psmux-tmp")).collect();
+    assert!(leftovers.is_empty(), "temp file leaked: {:?}", leftovers);
+}
