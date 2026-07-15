@@ -8,13 +8,16 @@ pub struct InstallReport {
 fn owned_marker(agent: &str) -> String { format!(" hook-notify {} ", agent) }
 
 fn desired_group(psmux_exe: &Path, agent: &str, arg: &str) -> serde_json::Value {
-    serde_json::json!({
-        "hooks": [{
-            "type": "command",
-            "command": format!("\"{}\" hook-notify {} {}", psmux_exe.display(), agent, arg),
-            "timeout": 10
-        }]
-    })
+    // codex executes hook commands via `powershell.exe -NoProfile -Command <string>`;
+    // a bare "quoted-exe" args string is a PS parser error (exit 1, hook reported failed).
+    // The call operator with a single-quoted path is the form PS actually invokes.
+    // claude's runner handles the plain quoted form — keep it (proven since increment 1).
+    let command = if agent == "codex" {
+        format!("& '{}' hook-notify {} {}", psmux_exe.display().to_string().replace('\'', "''"), agent, arg)
+    } else {
+        format!("\"{}\" hook-notify {} {}", psmux_exe.display(), agent, arg)
+    };
+    serde_json::json!({ "hooks": [{ "type": "command", "command": command, "timeout": 10 }] })
 }
 
 fn event_has_exact(arr: &serde_json::Value, want: &serde_json::Value) -> bool {

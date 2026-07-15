@@ -173,6 +173,19 @@ fn exact_match_detects_stale_command() {
 }
 
 #[test]
+fn codex_command_uses_powershell_call_operator() {
+    let exe = std::path::Path::new("C:\\bin\\psmux.exe");
+    let g = desired_group(exe, "codex", "stop");
+    let cmd = g["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(cmd, "& 'C:\\bin\\psmux.exe' hook-notify codex stop",
+        "codex hooks run via powershell -Command; must use call-operator form");
+    // claude keeps the proven quoted form
+    let gc = desired_group(exe, "claude", "stop");
+    let cmdc = gc["hooks"][0]["command"].as_str().unwrap();
+    assert_eq!(cmdc, "\"C:\\bin\\psmux.exe\" hook-notify claude stop");
+}
+
+#[test]
 fn owned_marker_is_per_agent() {
     assert_eq!(owned_marker("codex"), " hook-notify codex ");
     assert_eq!(owned_marker("gemini"), " hook-notify gemini ");
