@@ -136,29 +136,119 @@ pub fn install_claude(settings_path: &Path, psmux_exe: &Path) -> Result<InstallR
         &[("Stop", "stop"), ("SessionStart", "session-start"), ("SessionEnd", "session-end")])
 }
 
-pub fn uninstall_claude(settings_path: &Path) -> Result<InstallReport, String> {
-    let marker = owned_marker("claude");
-    let lock = acquire_lock(settings_path)?;
+/// Remove only owned COMMANDS; drop a group only if it becomes empty; drop an
+/// event array if it becomes empty. Returns whether anything changed.
+fn strip_owned_commands(v: &mut serde_json::Value, marker: &str) -> bool {
+    let mut changed = false;
+    if let Some(events) = v.get_mut("hooks").and_then(|h| h.as_object_mut()) {
+        for (_ev, arr) in events.iter_mut() {
+            if let Some(groups) = arr.as_array_mut() {
+                for g in groups.iter_mut() {
+                    if let Some(cmds) = g.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                        let before = cmds.len();
+                        cmds.retain(|c| !c["command"].as_str().map(|s| s.contains(marker)).unwrap_or(false));
+                        changed |= cmds.len() != before;
+                    }
+                }
+                let gb = groups.len();
+                groups.retain(|g| g["hooks"].as_array().map(|h| !h.is_empty()).unwrap_or(false));
+                changed |= groups.len() != gb;
+            }
+        }
+        let eb = events.len();
+        events.retain(|_k, arr| arr.as_array().map(|a| !a.is_empty()).unwrap_or(false));
+        changed |= events.len() != eb;
+    }
+    changed
+}
+
+pub fn uninstall_agent(path: &Path, agent: &str) -> Result<InstallReport, String> {
+    let marker = owned_marker(agent);
+    let lock = acquire_lock(path)?;
     let result = (|| {
-        let mut v = load(settings_path)?;
-        if !strip_owned(&mut v, &marker) { return Ok(InstallReport { changed: false, backup: None }); }
-        let bak = backup(settings_path)?;
-        atomic_write(settings_path, &serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)?;
+        let mut v = load(path)?;
+        if !strip_owned_commands(&mut v, &marker) { return Ok(InstallReport { changed: false, backup: None }); }
+        let bak = backup(path)?;
+        // Drop an empty psmux-created hooks container.
+        if v["hooks"].as_object().map(|o| o.is_empty()).unwrap_or(false) {
+            if let Some(o) = v.as_object_mut() { o.remove("hooks"); }
+        }
+        atomic_write(path, &serde_json::to_string_pretty(&v).map_err(|e| e.to_string())?)?;
+        let _ = clear_manifest(agent);
         Ok(InstallReport { changed: true, backup: bak })
     })();
     let _ = std::fs::remove_file(lock);
     result
 }
 
-pub fn status_claude(settings_path: &Path) -> String {
-    let marker = owned_marker("claude");
-    match load(settings_path) {
+pub fn status_agent(path: &Path, agent: &str, events: &[(&str, &str)], exe: &Path) -> String {
+    match load(path) {
         Ok(v) => {
-            let installed = v["hooks"]["Stop"].as_array().map(|a| a.iter().any(|g| is_owned(g, &marker))).unwrap_or(false);
-            format!("claude: {} ({})", if installed { "installed" } else { "not installed" }, settings_path.display())
+            let all = events.iter().all(|(fk, arg)| {
+                let want = desired_group(exe, agent, arg);
+                event_has_exact(&v["hooks"][fk], &want)
+            });
+            let exists = exe.exists();
+            let trust = if agent == "codex" && all { format!(" [{}]", codex_trust_state(path)) } else { String::new() };
+            format!("{}: {}{} (exe: {} {}) ({})", agent,
+                if all { "installed" } else { "not installed" }, trust,
+                exe.display(), if exists { "present" } else { "MISSING" }, path.display())
         }
-        Err(e) => format!("claude: unreadable ({})", e),
+        Err(e) => format!("{}: unreadable ({})", agent, e),
     }
+}
+
+/// Codex gates its hooks.json by a content hash recorded in config.toml
+/// [hooks.state.'<path>:stop:0:0'].trusted_hash. We cannot reproduce codex's
+/// hash without knowing its exact normalization (raw bytes vs. canonicalized
+/// JSON, line endings, etc.), and this repo has no existing sha256 helper to
+/// build on (verified via `grep -rn "sha256\|Sha256" src/` — no hits) and no
+/// sha2-family crate dependency. Per the brief's fallback, this is downgraded
+/// to presence-only detection: whether a trust entry for this hooks.json's
+/// stop hook exists at all ("trust-pending") vs none ("trust-unknown"). It
+/// NEVER claims "trusted" since that would require the byte-exact hash match
+/// we can't safely compute. Advisory only.
+fn codex_trust_state(hooks_path: &Path) -> &'static str {
+    let home = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")).unwrap_or_default();
+    let cfg = Path::new(&home).join(".codex").join("config.toml");
+    let Ok(cfg_s) = std::fs::read_to_string(&cfg) else {
+        return "trust-unknown";
+    };
+    let _ = hooks_path; // reserved: path-scoped lookup once codex's key format is confirmed
+    if cfg_s.contains("hooks.json:stop") {
+        "trust-pending"
+    } else {
+        "trust-unknown"
+    }
+}
+
+/// The manifest is shared across all agents/installs, so clearing one agent's
+/// entry races the same read-modify-write hazard as `write_manifest` — reuse
+/// the identical locked pattern to avoid a lost update.
+fn clear_manifest(agent: &str) -> Result<(), String> {
+    let mp = manifest_path();
+    if let Some(d) = mp.parent() { let _ = std::fs::create_dir_all(d); }
+    let lock = acquire_lock(&mp)?;
+    let result = (|| {
+        let mut m: serde_json::Value = std::fs::read_to_string(&mp).ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| serde_json::json!({}));
+        if let Some(o) = m.as_object_mut() { o.remove(agent); }
+        std::fs::write(&mp, serde_json::to_string_pretty(&m).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    })();
+    let _ = std::fs::remove_file(lock);
+    result
+}
+
+pub fn uninstall_claude(settings_path: &Path) -> Result<InstallReport, String> {
+    uninstall_agent(settings_path, "claude")
+}
+
+pub fn status_claude(settings_path: &Path) -> String {
+    let exe = std::env::current_exe().unwrap_or_default();
+    status_agent(settings_path, "claude",
+        &[("Stop", "stop"), ("SessionStart", "session-start"), ("SessionEnd", "session-end")], &exe)
 }
 
 /// Resolve the hooks manifest location.

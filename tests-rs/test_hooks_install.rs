@@ -202,3 +202,23 @@ fn install_codex_preserves_sibling_group() {
     let groups = v["hooks"]["Stop"].as_array().unwrap();
     assert_eq!(groups.len(), 2, "must ADD alongside the existing group, not clobber");
 }
+
+#[test]
+fn uninstall_removes_only_owned_command_keeps_sibling() {
+    let p = tmp("codex-uninstall");
+    let exe = std::path::Path::new("C:\\bin\\psmux.exe");
+    install_codex(&p, exe).unwrap();
+    // Add a user sibling command INTO psmux's own group.
+    {
+        let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        v["hooks"]["Stop"][0]["hooks"].as_array_mut().unwrap()
+            .push(serde_json::json!({"type":"command","command":"user-thing.exe"}));
+        std::fs::write(&p, v.to_string()).unwrap();
+    }
+    uninstall_agent(&p, "codex").unwrap();
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let cmds = v["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+    let joined: String = cmds.iter().map(|c| c["command"].as_str().unwrap_or("")).collect();
+    assert!(!joined.contains("hook-notify codex"), "psmux command must be gone");
+    assert!(joined.contains("user-thing.exe"), "user sibling must survive");
+}
