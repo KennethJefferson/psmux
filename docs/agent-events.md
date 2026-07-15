@@ -153,10 +153,11 @@ codex` reports `trust-pending` until a matching trust entry exists.
 not fire — so `agent-done` never publishes.** A relay that blocks on `wait-event` with no
 timeout would hang. Therefore, **always pass `--timeout` to `wait-event` in a relay** and
 fall back to `capture-pane --settle` on timeout. The bus is a latency optimization over
-polling, never a single point of hang:
+polling, never a single point of hang. Units differ by side: psmux `wait-event --timeout`
+is **milliseconds**; the `timeout` field inside codex's `hooks.json` entries is **seconds**:
 
 ```powershell
-psmux wait-event --name agent-done --pane %1 --timeout 60   # exit 2 = timeout → fall back to settle
+psmux wait-event --name agent-done --pane %1 --timeout 60000   # ms! exit 2 = timeout → fall back to settle
 ```
 
 The installer's file safety (locked read-modify-write, backup-on-change-only, atomic
